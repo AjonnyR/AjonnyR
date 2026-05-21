@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 import logging
 from telegram import Update
@@ -112,6 +113,15 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN לא מוגדר בסביבה!")
+
+    # Python 3.14 removed implicit event-loop creation in
+    # asyncio.get_event_loop(); python-telegram-bot 21.6 still calls it
+    # synchronously from run_webhook/run_polling. Pre-create a loop so
+    # the library finds one regardless of interpreter version.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
