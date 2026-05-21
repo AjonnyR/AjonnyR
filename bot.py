@@ -1,4 +1,5 @@
 import os
+import tempfile
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -8,16 +9,18 @@ from analyzer import analyze_expenses
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+TMP = tempfile.gettempdir()
+
 # זוכר את הקבצים של כל משתמש עד שהוא שולח את שניהם
 user_files = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "שלום! 👋 אני הבוט שיעזור לך לעקוב אחרי ההוצאות שלך.\n\n"
+        "שלום! 👋 אני הבוט שיעזור לך לעקוב אחרי הכסף שלך.\n\n"
         "📤 *איך להשתמש בי:*\n"
-        "1. שלח לי את קובץ ה-PDF מ*פועלים* (חיובי האשראי)\n"
-        "2. שלח לי את קובץ ה-Excel מ*מקס* (חיובי האשראי)\n"
-        "3. אני אנתח הכל ואחזיר לך דוח מפורט עם טיפים 💡\n\n"
+        "1. שלח לי את קובץ ה-PDF מ*פועלים* (עו\"ש — כולל הכנסות)\n"
+        "2. שלח לי את קובץ ה-Excel מ*מקס* (פירוט חיובי אשראי)\n"
+        "3. אני אנתח הכל ואחזיר לך דוח עם הכנסות, הוצאות, תזרים נטו וטיפים 💡\n\n"
         "אפשר לשלוח את הקבצים בכל סדר שתרצה!",
         parse_mode="Markdown"
     )
@@ -53,7 +56,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_name.endswith(".pdf"):
         await update.message.reply_text("📥 קיבלתי את קובץ פועלים! מעבד...")
         file = await context.bot.get_file(doc.file_id)
-        file_path = f"/tmp/{user_id}_poalim.pdf"
+        file_path = os.path.join(TMP, f"{user_id}_poalim.pdf")
         await file.download_to_drive(file_path)
 
         transactions = process_pdf(file_path)
@@ -71,7 +74,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif file_name.endswith((".xlsx", ".xls")):
         await update.message.reply_text("📥 קיבלתי את קובץ מקס! מעבד...")
         file = await context.bot.get_file(doc.file_id)
-        file_path = f"/tmp/{user_id}_max.xlsx"
+        file_path = os.path.join(TMP, f"{user_id}_max.xlsx")
         await file.download_to_drive(file_path)
 
         transactions = process_excel(file_path)
@@ -116,8 +119,22 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("הבוט מתחיל לרוץ...")
-    app.run_polling()
+    webhook_url = os.environ.get("WEBHOOK_URL")
+    if webhook_url:
+        # Production (Render etc.): listen on $PORT, let Telegram POST updates.
+        # Telegram remembers the webhook URL, so when the dyno wakes from
+        # sleep the first message arriving wakes the service and is delivered.
+        port = int(os.environ.get("PORT", "8080"))
+        logger.info(f"Starting in webhook mode on port {port}, url={webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=token,
+            webhook_url=f"{webhook_url.rstrip('/')}/{token}",
+        )
+    else:
+        logger.info("Starting in polling mode (local dev)")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
