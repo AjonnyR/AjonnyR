@@ -61,10 +61,48 @@ CATEGORY_RULES: dict[str, list[str]] = {
 
 
 def categorize(description: str) -> str:
-    """Return the category for a description, falling back to 'אחר'."""
+    """Return the category for a description.
+
+    Lookup order: learned cache (populated by AI on previous calls) →
+    static keyword rules → "אחר". The learned cache lets AI's
+    categorisations carry forward to local-only runs without code edits.
+    """
+    if description in LEARNED:
+        return LEARNED[description]
     desc_lower = description.lower()
     for category, keywords in CATEGORY_RULES.items():
         for kw in keywords:
             if kw.lower() in desc_lower:
                 return category
     return "אחר"
+
+
+# In-memory cache of merchant → category learned from AI in past calls.
+# Survives across requests within the same Render container instance;
+# wiped on cold start (sleep + wake / redeploy). To persist across cold
+# starts, copy entries from the bot's report into CATEGORY_RULES above.
+LEARNED: dict[str, str] = {}
+
+
+def learn(description: str, category: str) -> bool:
+    """Record an AI categorisation for future reuse. Returns True if new."""
+    if category not in CATEGORY_RULES:
+        return False
+    if LEARNED.get(description) == category:
+        return False
+    # Don't waste a learned slot on something the static rules already cover.
+    desc_lower = description.lower()
+    for cat, keywords in CATEGORY_RULES.items():
+        for kw in keywords:
+            if kw.lower() in desc_lower:
+                # Static rule would have caught this anyway; only store if
+                # the AI disagrees with the rule.
+                if cat == category:
+                    return False
+                break
+    LEARNED[description] = category
+    return True
+
+
+def get_learned() -> dict[str, str]:
+    return dict(LEARNED)

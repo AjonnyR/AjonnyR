@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import time
 
-from categories import categorize, CATEGORY_RULES
+from categories import categorize, learn, get_learned, CATEGORY_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +48,7 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
     poalim_count = sum(1 for t in expenses if "פועלים" in t["source"])
     max_count = sum(1 for t in expenses if t["source"] == "מקס")
 
-    # Local aggregation
-    cat_totals = _local_categorise(expenses)
+    # Merchant aggregation (always local — pure math)
     by_desc: dict[str, dict] = {}
     for t in expenses:
         key = t["description"]
@@ -59,64 +58,80 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
         by_desc[key]["count"] += 1
     top_merchants = sorted(by_desc.items(), key=lambda x: x[1]["total"], reverse=True)[:8]
 
-    # Try Gemini ONLY for tips (small prompt)
+    # Ask AI to categorise unique descriptions and produce tips in one call.
+    # If AI fails, categorisation falls back to categorize() (which already
+    # consults LEARNED from any prior successful AI call this container).
+    unique_descs = list(by_desc.keys())
     api_key = os.environ.get("GEMINI_API_KEY")
+    ai_categories: dict[str, str] = {}
     ai_tips: list[str] = []
     ai_error: Exception | None = None
+    newly_learned: dict[str, str] = {}
+
     if api_key:
         try:
-            ai_tips = await _get_ai_tips(
-                api_key, cat_totals, top_merchants,
-                total_income, total_expense, net_flow,
+            ai_categories, ai_tips = await _get_ai_analysis(
+                api_key, unique_descs, total_income, total_expense, net_flow,
             )
+            for desc, cat in ai_categories.items():
+                if learn(desc, cat):
+                    newly_learned[desc] = cat
         except Exception as e:
             ai_error = e
-            logger.error(f"Gemini tips call failed: {e}")
+            logger.error(f"Gemini analysis failed: {e}")
 
-    # Fall back to local tips if AI didn't deliver
+    # Build per-transaction category using AI's answer first, then the
+    # categorize() chain (LEARNED → static rules → "אחר").
+    cat_totals: dict[str, float] = {}
+    for t in expenses:
+        cat = ai_categories.get(t["description"]) or categorize(t["description"])
+        if cat not in CATEGORY_RULES:
+            cat = "אחר"
+        cat_totals[cat] = cat_totals.get(cat, 0.0) + t["amount"]
+
+    # Tips: use AI's if delivered, otherwise local rule-based.
     tips = ai_tips if ai_tips else _local_tips(
         expenses, total_expense, total_income, net_flow, cat_totals
     )
 
     return _format_report(
-        cat_totals, top_merchants, tips,
+        cat_totals, top_merchants, tips, newly_learned,
         expenses, incomes, max_summary_skipped,
         total_expense, total_income, net_flow,
         poalim_count, max_count, closing_balance,
-        ai_error if not ai_tips else None,
+        ai_error if not ai_categories else None,
     )
 
 
-async def _get_ai_tips(
+async def _get_ai_analysis(
     api_key: str,
-    cat_totals: dict[str, float],
-    top_merchants: list[tuple[str, dict]],
+    descriptions: list[str],
     total_income: float,
     total_expense: float,
     net_flow: float,
-) -> list[str]:
-    """Call Gemini with an aggregated summary (no raw transactions) and
-    return a list of tips. ~150 tokens of input vs ~1500 before."""
-    cat_lines = "\n".join(
-        f"- {c}: {a:,.0f} ₪"
-        for c, a in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
-        if a > 0
-    )
-    merchant_lines = "\n".join(
-        f"- {name}: {info['total']:,.0f} ₪ ({info['count']}x)"
-        for name, info in top_merchants[:6]
-    )
+) -> tuple[dict[str, str], list[str]]:
+    """Ask Gemini to categorise every unique description AND produce tips
+    in one call. Returns (description_to_category, tips).
+
+    Prompt size scales with the number of unique merchants (~30 chars
+    each), not with the number of transactions. Typical: 300-500 tokens
+    input, 200-400 tokens output."""
+    cat_list = ", ".join(CATEGORY_RULES.keys())
+    desc_lines = "\n".join(f"- {d}" for d in descriptions)
 
     prompt = (
-        f"Israeli user's monthly statement (ILS):\n"
+        f"You are a personal finance assistant for an Israeli user. Reply in Hebrew.\n\n"
+        f"Monthly statement (ILS):\n"
         f"- Income: {total_income:,.0f}\n"
         f"- Expenses: {total_expense:,.0f}\n"
         f"- Net: {net_flow:+,.0f}\n\n"
-        f"Category breakdown:\n{cat_lines}\n\n"
-        f"Top merchants:\n{merchant_lines}\n\n"
-        f"Give 3-5 specific, actionable savings/optimisation tips in Hebrew, "
-        f"based on this data. Reply with ONLY a JSON array of Hebrew strings, "
-        f"no markdown, no backticks. Example: [\"tip 1\", \"tip 2\"]"
+        f"Categorise each of these merchant/transaction descriptions into "
+        f"exactly one of: {cat_list}\n\n"
+        f"Descriptions:\n{desc_lines}\n\n"
+        f"Then give 3-5 specific, actionable Hebrew tips based on the data.\n\n"
+        f'Reply with ONLY this JSON, no markdown, no backticks:\n'
+        f'{{"categories": {{"<description>": "<category>", ...}}, '
+        f'"tips": ["tip 1", "tip 2", "tip 3"]}}'
     )
 
     loop = asyncio.get_event_loop()
@@ -134,7 +149,7 @@ async def _get_ai_tips(
                 raise
 
     if raw_text is None:
-        return []
+        return {}, []
 
     clean = raw_text.strip()
     if clean.startswith("```"):
@@ -144,12 +159,23 @@ async def _get_ai_tips(
     clean = clean.strip()
 
     try:
-        tips = json.loads(clean)
-        if isinstance(tips, list):
-            return [str(t) for t in tips][:5]
+        data = json.loads(clean)
     except json.JSONDecodeError:
-        logger.warning(f"Gemini returned non-JSON tips: {raw_text[:200]}")
-    return []
+        logger.warning(f"Gemini returned non-JSON: {raw_text[:200]}")
+        return {}, []
+
+    raw_cats = data.get("categories", {}) if isinstance(data, dict) else {}
+    cats: dict[str, str] = {}
+    if isinstance(raw_cats, dict):
+        for desc, cat in raw_cats.items():
+            cat_str = str(cat).strip()
+            if cat_str in CATEGORY_RULES:
+                cats[str(desc)] = cat_str
+
+    raw_tips = data.get("tips", []) if isinstance(data, dict) else []
+    tips = [str(t) for t in raw_tips][:5] if isinstance(raw_tips, list) else []
+
+    return cats, tips
 
 
 async def test_gemini(api_key: str) -> tuple[bool, str]:
@@ -235,15 +261,6 @@ def _balance_section(closing_balance: float | None) -> str:
     if closing_balance is None:
         return ""
     return f"🏦 *יתרה נוכחית בפועלים:* {closing_balance:,.2f} ₪\n\n"
-
-
-def _local_categorise(expenses: list[dict]) -> dict[str, float]:
-    """Group expenses by category using categories.py rules."""
-    totals: dict[str, float] = {}
-    for t in expenses:
-        cat = categorize(t["description"])
-        totals[cat] = totals.get(cat, 0.0) + t["amount"]
-    return totals
 
 
 def _local_tips(
@@ -340,6 +357,7 @@ def _format_report(
     cat_totals: dict[str, float],
     top_merchants: list[tuple[str, dict]],
     tips: list[str],
+    newly_learned: dict[str, str],
     expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
     total_expense: float, total_income: float, net_flow: float,
     poalim_count: int, max_count: int,
@@ -383,6 +401,15 @@ def _format_report(
         for i, tip in enumerate(tips[:5], 1):
             report += f"{i}. {tip}\n"
         report += "\n"
+
+    if newly_learned:
+        report += "🎓 *הבוט למד קטגוריות חדשות מה-AI:*\n"
+        for desc, cat in newly_learned.items():
+            report += f"   • {desc} → {cat}\n"
+        report += (
+            "_להפיכתן לקבועות (שיעבוד גם בלי AI): הוסף אותן ל-CATEGORY\\_RULES "
+            "ב-categories.py ו-push לריפו._\n\n"
+        )
 
     report += "_לעדכון קטגוריות (למשל \"שיק\" → שכר דירה): ערוך את categories.py בריפו._\n"
     report += "_לניתוח חודש חדש: /reset_"
