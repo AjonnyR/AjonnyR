@@ -56,8 +56,11 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
                        the Max file rows — that would double-count)
       - expense      : everything else
     """
+    # The "##" marker appears either on its own line ("##\n₪...") or — for
+    # the very first (most recent) transaction — inline with the data
+    # ("## ₪..."). Allow either with \s+ so we don't drop the latest row.
     pattern = re.compile(
-        r'##\n(₪[\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+(.+?)\s+(\d{2}/\d{2}/\d{4})'
+        r'##\s+(₪[\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+(.+?)\s+(\d{2}/\d{2}/\d{4})'
     )
 
     # Hebrew keywords (reversed, since pdfplumber returns text reversed)
@@ -144,12 +147,22 @@ def process_excel(file_path: str) -> list[dict]:
             if any("תאריך" in c for c in row_str) and any("עסק" in c or "תיאור" in c for c in row_str):
                 header_row = i
                 for j, cell in enumerate(row_str):
-                    if "תאריך" in cell and "עסקה" in cell:
+                    if "תאריך עסקה" in cell:
                         col_map["date"] = j
-                    elif "שם בית עסק" in cell or "תיאור" in cell:
+                    elif "שם בית" in cell or "תיאור" in cell:
+                        # Catches both "שם בית עסק" and "שם בית העסק".
                         col_map["description"] = j
-                    elif "סכום חיוב" in cell or "סכום עסקה" in cell:
+                    elif "סכום חיוב" in cell:
+                        # Prefer the actually-charged amount, not "סכום עסקה
+                        # מקורי" which holds the gross/installment-total
+                        # and inflates totals for split payments.
                         col_map["amount"] = j
+                # If no "סכום חיוב" column exists, fall back to "סכום עסקה".
+                if "amount" not in col_map:
+                    for j, cell in enumerate(row_str):
+                        if "סכום עסקה" in cell:
+                            col_map["amount"] = j
+                            break
                 break
 
         if not header_row or "date" not in col_map:
