@@ -60,12 +60,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = os.path.join(TMP, f"{user_id}_poalim.pdf")
         await file.download_to_drive(file_path)
 
-        transactions = process_pdf(file_path)
+        transactions, closing_balance = process_pdf(file_path)
         if not transactions:
             await update.message.reply_text("⚠️ לא הצלחתי לקרוא עסקאות מה-PDF. ודא שזה קובץ פועלים תקין.")
             return
 
         user_files[user_id]["poalim"] = transactions
+        user_files[user_id]["closing_balance"] = closing_balance
         await update.message.reply_text(
             f"✅ עיבדתי את קובץ פועלים — מצאתי *{len(transactions)}* עסקאות.\n\n"
             f"עכשיו שלח לי את קובץ ה-Excel ממקס כדי שאוכל לנתח הכל יחד.",
@@ -100,7 +101,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_transactions = user_files[user_id]["poalim"] + user_files[user_id]["max"]
 
         try:
-            report = await analyze_expenses(all_transactions)
+            report = await analyze_expenses(
+                all_transactions,
+                closing_balance=user_files[user_id].get("closing_balance"),
+            )
             await update.message.reply_text(report, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Error analyzing: {e}")

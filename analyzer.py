@@ -6,21 +6,18 @@ import urllib.request
 import urllib.error
 import time
 
+from categories import categorize, CATEGORY_RULES
+
 logger = logging.getLogger(__name__)
 
-CATEGORIES = [
-    "מזון וסופרמרקט", "מסעדות ובתי קפה", "תחבורה ודלק",
-    "קניות ואופנה", "בריאות ופארמה", "בילוי ופנאי",
-    "חינוך", "תקשורת וסלולר", "ביטוח ופיננסים",
-    "העברות ותשלומים", "אחר"
-]
+CATEGORIES = list(CATEGORY_RULES.keys())
 
 # Max transactions sent to Gemini (the rest are summarised locally to stay
 # inside the free-tier quota).
 MAX_SAMPLE = 50
 
 
-async def analyze_expenses(transactions: list[dict]) -> str:
+async def analyze_expenses(transactions: list[dict], closing_balance: float | None = None) -> str:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set!")
@@ -102,7 +99,7 @@ Tips must be specific to what you saw, not generic."""
         return _format_report_no_ai(
             expenses, incomes, max_summary_skipped,
             total_expense, total_income, net_flow,
-            poalim_count, max_count, last_error,
+            poalim_count, max_count, closing_balance, last_error,
         )
 
     clean = raw_text.strip()
@@ -119,13 +116,13 @@ Tips must be specific to what you saw, not generic."""
         return _format_report_no_ai(
             expenses, incomes, max_summary_skipped,
             total_expense, total_income, net_flow,
-            poalim_count, max_count, e,
+            poalim_count, max_count, closing_balance, e,
         )
 
     return _format_report(
         data, expenses, incomes, max_summary_skipped,
         total_expense, total_income, net_flow,
-        poalim_count, max_count,
+        poalim_count, max_count, closing_balance,
     )
 
 
@@ -177,7 +174,7 @@ def _max_summary_note(max_summary_skipped: list[dict]) -> str:
 def _net_flow_section(total_income: float, total_expense: float, net_flow: float) -> str:
     if total_income == 0:
         return ""
-    section = "📈 *תזרים נטו:*\n"
+    section = "📈 *תזרים נטו (לתקופת הדוח):*\n"
     section += f"   הכנסות: +{total_income:,.0f} ₪\n"
     section += f"   הוצאות: −{total_expense:,.0f} ₪\n"
     sign = "+" if net_flow >= 0 else "−"
@@ -186,11 +183,27 @@ def _net_flow_section(total_income: float, total_expense: float, net_flow: float
     return section
 
 
+def _balance_section(closing_balance: float | None) -> str:
+    if closing_balance is None:
+        return ""
+    return f"🏦 *יתרה נוכחית בפועלים:* {closing_balance:,.2f} ₪\n\n"
+
+
+def _local_categorise(expenses: list[dict]) -> dict[str, float]:
+    """Group expenses by category using categories.py rules."""
+    totals: dict[str, float] = {}
+    for t in expenses:
+        cat = categorize(t["description"])
+        totals[cat] = totals.get(cat, 0.0) + t["amount"]
+    return totals
+
+
 def _format_report(
     data: dict,
     expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
     total_expense: float, total_income: float, net_flow: float,
     poalim_count: int, max_count: int,
+    closing_balance: float | None,
 ) -> str:
     categories = data.get("categories", {})
     top_merchants = data.get("top_merchants", [])
@@ -198,6 +211,7 @@ def _format_report(
     summary = data.get("summary", "")
 
     report = "📊 *דוח חודשי*\n\n"
+    report += _balance_section(closing_balance)
     report += f"💳 סה\"כ הוצאות: *{total_expense:,.0f} ₪*\n"
     report += f"   • פועלים עו\"ש: {poalim_count} תנועות\n"
     report += f"   • מקס: {max_count} עסקאות\n\n"
@@ -238,10 +252,12 @@ def _format_report_no_ai(
     expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
     total_expense: float, total_income: float, net_flow: float,
     poalim_count: int, max_count: int,
+    closing_balance: float | None,
     error: Exception | None,
 ) -> str:
     """Fallback report when Gemini is unavailable (quota / network).
-    Shows totals, income, net flow, and top merchants computed locally."""
+    Shows totals, income, net flow, locally-categorised expenses, and top
+    merchants computed locally."""
     report = "📊 *דוח חודשי* _(ללא AI — פולבק מקומי)_\n\n"
 
     if isinstance(error, urllib.error.HTTPError) and error.code == 429:
@@ -249,6 +265,7 @@ def _format_report_no_ai(
     elif error is not None:
         report += "⚠️ _שירות ה-AI לא היה זמין. הניתוח מתבסס על חישוב מקומי בלבד._\n\n"
 
+    report += _balance_section(closing_balance)
     report += f"💳 סה\"כ הוצאות: *{total_expense:,.0f} ₪*\n"
     report += f"   • פועלים עו\"ש: {poalim_count} תנועות\n"
     report += f"   • מקס: {max_count} עסקאות\n\n"
@@ -256,6 +273,18 @@ def _format_report_no_ai(
     report += _max_summary_note(max_summary_skipped)
     report += _income_section(incomes, total_income)
     report += _net_flow_section(total_income, total_expense, net_flow)
+
+    # Local categorisation
+    cat_totals = _local_categorise(expenses)
+    if cat_totals and total_expense > 0:
+        report += "📂 *פילוח הוצאות (לפי כללים מקומיים):*\n"
+        for cat, amount in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True):
+            if amount <= 0:
+                continue
+            pct = amount / total_expense * 100
+            bar = "🔴" if pct >= 30 else ("🟡" if pct >= 15 else "🟢")
+            report += f"{bar} {cat}: *{amount:,.0f} ₪* ({pct:.0f}%)\n"
+        report += "\n"
 
     # Local top-merchants: aggregate by description
     by_desc: dict[str, dict] = {}
@@ -273,5 +302,6 @@ def _format_report_no_ai(
             report += f"   • {name}: {info['total']:,.0f} ₪ ({info['count']} פעמים)\n"
         report += "\n"
 
+    report += "_לעדכון קטגוריות (למשל \"שיק\" → שכר דירה): ערוך את categories.py בריפו._\n"
     report += "_לניתוח חודש חדש: /reset_"
     return report

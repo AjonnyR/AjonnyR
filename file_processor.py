@@ -2,12 +2,20 @@ import pdfplumber
 import openpyxl
 import re
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-def process_pdf(file_path: str) -> list[dict]:
-    transactions = []
+def process_pdf(file_path: str) -> tuple[list[dict], float | None]:
+    """Parse a Hapoalim PDF.
+
+    Returns (transactions, closing_balance). closing_balance is the balance
+    after the most recent dated transaction in the statement — i.e. the
+    user's current account balance — or None if it couldn't be extracted.
+    """
+    transactions: list[dict] = []
+    closing_balance: float | None = None
     try:
         with pdfplumber.open(file_path) as pdf:
             full_text = ""
@@ -15,12 +23,12 @@ def process_pdf(file_path: str) -> list[dict]:
                 text = page.extract_text()
                 if text:
                     full_text += text + "\n"
-        transactions = _parse_poalim_evosh(full_text)
+        transactions, closing_balance = _parse_poalim_evosh(full_text)
     except Exception as e:
         logger.error(f"PDF read error: {e}")
-        return []
-    logger.info(f"פועלים: נמצאו {len(transactions)} עסקאות")
-    return transactions
+        return [], None
+    logger.info(f"פועלים: נמצאו {len(transactions)} עסקאות, יתרה={closing_balance}")
+    return transactions, closing_balance
 
 
 def _fix_rtl(text: str) -> str:
@@ -76,7 +84,10 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
     ]
 
     transactions = []
+    balances_by_date: list[tuple[datetime, float]] = []
+
     for m in pattern.finditer(text):
+        balance_str = m.group(1)
         amount_str = m.group(2)
         desc_raw = m.group(3).strip()
         date = m.group(4)
@@ -88,6 +99,13 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
                 continue
         except ValueError:
             continue
+
+        try:
+            balance = float(balance_str.replace("₪", "").replace(",", ""))
+            dt = datetime.strptime(date, "%d/%m/%Y")
+            balances_by_date.append((dt, balance))
+        except ValueError:
+            pass
 
         if any(kw in desc_raw for kw in INCOME_KEYWORDS):
             tx_type = "income"
@@ -104,7 +122,12 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
             "type": tx_type,
         })
 
-    return transactions
+    closing_balance: float | None = None
+    if balances_by_date:
+        balances_by_date.sort(key=lambda x: x[0], reverse=True)
+        closing_balance = balances_by_date[0][1]
+
+    return transactions, closing_balance
 
 
 def process_excel(file_path: str) -> list[dict]:
