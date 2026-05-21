@@ -169,7 +169,11 @@ async def test_gemini(api_key: str) -> tuple[bool, str]:
 
 
 def _call_gemini(api_key: str, prompt: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    # Default model has the most generous free tier as of late 2025;
+    # gemini-2.0-flash is paid-only on most free accounts. Override via
+    # the GEMINI_MODEL env var if needed.
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2000}
