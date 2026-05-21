@@ -198,6 +198,96 @@ def _local_categorise(expenses: list[dict]) -> dict[str, float]:
     return totals
 
 
+def _local_tips(
+    expenses: list[dict],
+    total_expense: float,
+    total_income: float,
+    net_flow: float,
+    cat_totals: dict[str, float],
+) -> list[str]:
+    """Generate rule-based savings tips without AI.
+
+    Tips are derived from the data: dominant category/merchant, deficit,
+    cash withdrawals, possible subscriptions. Returns 0-5 tips.
+    """
+    tips: list[str] = []
+
+    # 1. Deficit warning
+    if total_income > 0 and net_flow < 0:
+        deficit_pct = abs(net_flow) / total_income * 100
+        tips.append(
+            f"החודש הוצאת {abs(net_flow):,.0f} ₪ יותר ממה שהכנסת "
+            f"({deficit_pct:.0f}% גרעון). זהה 1-2 קטגוריות לקיצוץ."
+        )
+
+    # 2. Dominant category (>= 35% of expenses, excluding "אחר")
+    if total_expense > 0 and cat_totals:
+        ranked = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+        for cat, amt in ranked:
+            if cat == "אחר":
+                continue
+            pct = amt / total_expense * 100
+            if pct >= 35:
+                tips.append(
+                    f"הקטגוריה הגדולה ביותר היא {cat} עם {pct:.0f}% מההוצאות "
+                    f"({amt:,.0f} ₪). שווה לבדוק לעומק מה יושב שם."
+                )
+            break
+
+    # 3. Dominant single merchant (>= 15%), skipping generic "transfer"-like entries
+    SKIP = ("העברה", "העב'", "שיק", "ביט", "bit", "משיכה", "בנקט", "לא ידוע")
+    by_desc: dict[str, float] = {}
+    for t in expenses:
+        if any(s in t["description"] for s in SKIP):
+            continue
+        by_desc[t["description"]] = by_desc.get(t["description"], 0.0) + t["amount"]
+    if by_desc and total_expense > 0:
+        top_merchant, top_amt = max(by_desc.items(), key=lambda x: x[1])
+        top_pct = top_amt / total_expense * 100
+        if top_pct >= 15:
+            tips.append(
+                f"בית עסק יחיד ({top_merchant}) לקח {top_pct:.0f}% מההוצאות החודש "
+                f"({top_amt:,.0f} ₪). אם זה צפוי — מצוין. אם לא — שווה בדיקה."
+            )
+
+    # 4. Cash withdrawals: hard to track
+    withdrawals = [t for t in expenses if "משיכה" in t["description"] or "בנקט" in t["description"]]
+    total_withdrawn = sum(t["amount"] for t in withdrawals)
+    if total_withdrawn >= 1000:
+        tips.append(
+            f"בוצעו {len(withdrawals)} משיכות מזומן בסך {total_withdrawn:,.0f} ₪. "
+            f"מזומן קשה לעקוב — תשלום בכרטיס ייתן לך דוחות מדויקים יותר."
+        )
+
+    # 5. Recurring charges (3+ times with similar amounts) — likely subscriptions
+    groups: dict[str, list[float]] = {}
+    for t in expenses:
+        if any(s in t["description"] for s in SKIP):
+            continue
+        groups.setdefault(t["description"], []).append(t["amount"])
+    for desc, amts in groups.items():
+        if len(amts) < 3:
+            continue
+        avg = sum(amts) / len(amts)
+        if avg > 0 and all(abs(a - avg) / avg < 0.2 for a in amts):
+            tips.append(
+                f"חיובים חוזרים מ-{desc}: {len(amts)} פעמים, ~{avg:,.0f} ₪ כל פעם. "
+                f"אם זה מנוי שכבר לא בשימוש — בטל אותו."
+            )
+            break  # one subscription tip is enough
+
+    # 6. Eating-out heavy (>= 15% of expenses)
+    eating_out = cat_totals.get("מסעדות ובתי קפה", 0.0)
+    if total_expense > 0 and eating_out / total_expense >= 0.15:
+        tips.append(
+            f"הוצאת {eating_out:,.0f} ₪ במסעדות ובתי קפה "
+            f"({eating_out / total_expense * 100:.0f}% מהחודש). בישול בבית 2-3 פעמים בשבוע "
+            f"יכול לחסוך מאות שקלים."
+        )
+
+    return tips[:5]
+
+
 def _format_report(
     data: dict,
     expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
@@ -238,6 +328,12 @@ def _format_report(
 
     if summary:
         report += f"💬 _{summary}_\n\n"
+
+    if not tips:
+        # Gemini didn't return tips — fall back to locally-derived ones so
+        # the user still gets actionable advice.
+        cat_totals = _local_categorise(expenses)
+        tips = _local_tips(expenses, total_expense, total_income, net_flow, cat_totals)
 
     if tips:
         report += "💡 *טיפים לחסכון:*\n"
@@ -300,6 +396,13 @@ def _format_report_no_ai(
         report += "🏪 *בתי עסק מובילים:*\n"
         for name, info in top:
             report += f"   • {name}: {info['total']:,.0f} ₪ ({info['count']} פעמים)\n"
+        report += "\n"
+
+    tips = _local_tips(expenses, total_expense, total_income, net_flow, cat_totals)
+    if tips:
+        report += "💡 *טיפים לייעול:*\n"
+        for i, tip in enumerate(tips, 1):
+            report += f"{i}. {tip}\n"
         report += "\n"
 
     report += "_לעדכון קטגוריות (למשל \"שיק\" → שכר דירה): ערוך את categories.py בריפו._\n"
