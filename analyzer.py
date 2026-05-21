@@ -121,13 +121,15 @@ async def _get_ai_tips(
 
     loop = asyncio.get_event_loop()
     raw_text = None
-    for attempt in range(2):
+    # 429 = quota, 503 = model overloaded — both are transient enough to retry.
+    RETRYABLE = {429, 503}
+    for attempt in range(3):
         try:
             raw_text = await loop.run_in_executor(None, lambda: _call_gemini(api_key, prompt))
             break
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 1:
-                await asyncio.sleep(15)
+            if e.code in RETRYABLE and attempt < 2:
+                await asyncio.sleep(10 if e.code == 503 else 15)
             else:
                 raise
 
