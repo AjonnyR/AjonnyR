@@ -5,7 +5,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from file_processor import process_pdf, process_excel
-from analyzer import analyze_expenses
+from analyzer import analyze_expenses, test_gemini
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +44,23 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_files:
         del user_files[user_id]
     await update.message.reply_text("✅ איפסתי את הנתונים שלך. תוכל לשלוח קבצים חדשים.")
+
+
+async def api_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostic: ping Gemini with a tiny prompt and show the real error."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        await update.message.reply_text("❌ GEMINI_API_KEY לא מוגדר בכלל ב-Render.")
+        return
+    masked = f"{api_key[:6]}…{api_key[-4:]}" if len(api_key) > 12 else "(too short)"
+    await update.message.reply_text(f"בודק את המפתח `{masked}`...", parse_mode="Markdown")
+    ok, message = await test_gemini(api_key)
+    if ok:
+        await update.message.reply_text(f"✅ המפתח עובד. תגובה: {message}")
+    else:
+        # Pre-escape underscores so Markdown doesn't choke on error bodies.
+        safe = message.replace("_", "\\_")
+        await update.message.reply_text(f"❌ נכשל:\n```\n{safe}\n```", parse_mode="Markdown")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -131,6 +148,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")

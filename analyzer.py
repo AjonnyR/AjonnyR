@@ -12,25 +12,23 @@ logger = logging.getLogger(__name__)
 
 CATEGORIES = list(CATEGORY_RULES.keys())
 
-# Max transactions sent to Gemini (the rest are summarised locally to stay
-# inside the free-tier quota).
-MAX_SAMPLE = 50
-
-
 async def analyze_expenses(transactions: list[dict], closing_balance: float | None = None) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not set!")
+    """Produce the full report.
 
+    Categorisation, merchant aggregation, balance and net-flow are all done
+    LOCALLY. Gemini is asked only for personalised tips (a tiny prompt) —
+    if it fails, we fall back to local rule-based tips. This keeps API
+    usage minimal and the report still works even when AI is unavailable.
+    """
     # Poalim is the main account. The monthly "Max" debit line in Poalim
     # is just a summary of the per-merchant rows in the Max file — if we
     # also got the Max file, exclude those summary lines from the totals
     # to avoid double-counting.
     has_max_file = any(t.get("source") == "מקס" for t in transactions)
 
-    expenses = []
-    incomes = []
-    max_summary_skipped = []
+    expenses: list[dict] = []
+    incomes: list[dict] = []
+    max_summary_skipped: list[dict] = []
     for t in transactions:
         ttype = t.get("type", "expense")
         if ttype == "income":
@@ -50,57 +48,91 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
     poalim_count = sum(1 for t in expenses if "פועלים" in t["source"])
     max_count = sum(1 for t in expenses if t["source"] == "מקס")
 
-    sample = expenses[:MAX_SAMPLE]
-    transactions_text = _format_transactions(sample)
-    note = f"(showing {len(sample)} of {len(expenses)} expenses)" if len(expenses) > MAX_SAMPLE else ""
+    # Local aggregation
+    cat_totals = _local_categorise(expenses)
+    by_desc: dict[str, dict] = {}
+    for t in expenses:
+        key = t["description"]
+        if key not in by_desc:
+            by_desc[key] = {"total": 0.0, "count": 0}
+        by_desc[key]["total"] += t["amount"]
+        by_desc[key]["count"] += 1
+    top_merchants = sorted(by_desc.items(), key=lambda x: x[1]["total"], reverse=True)[:8]
 
-    prompt = f"""You are a personal finance assistant. Analyze these Israeli expense transactions and reply in Hebrew.
+    # Try Gemini ONLY for tips (small prompt)
+    api_key = os.environ.get("GEMINI_API_KEY")
+    ai_tips: list[str] = []
+    ai_error: Exception | None = None
+    if api_key:
+        try:
+            ai_tips = await _get_ai_tips(
+                api_key, cat_totals, top_merchants,
+                total_income, total_expense, net_flow,
+            )
+        except Exception as e:
+            ai_error = e
+            logger.error(f"Gemini tips call failed: {e}")
 
-Total expenses: {len(expenses)} {note}
-Total spending: {total_expense:,.0f} ILS
+    # Fall back to local tips if AI didn't deliver
+    tips = ai_tips if ai_tips else _local_tips(
+        expenses, total_expense, total_income, net_flow, cat_totals
+    )
 
-Expenses:
-{transactions_text}
+    return _format_report(
+        cat_totals, top_merchants, tips,
+        expenses, incomes, max_summary_skipped,
+        total_expense, total_income, net_flow,
+        poalim_count, max_count, closing_balance,
+        ai_error if not ai_tips else None,
+    )
 
-Categories: {', '.join(CATEGORIES)}
 
-Reply with ONLY a JSON object, no markdown, no backticks:
-{{
-  "categories": {{"category name": total_amount}},
-  "top_merchants": [{{"name": "...", "total": 0.0, "count": 0}}],
-  "tips": ["specific tip 1", "specific tip 2", "specific tip 3"],
-  "summary": "one sentence personal summary in Hebrew"
-}}
+async def _get_ai_tips(
+    api_key: str,
+    cat_totals: dict[str, float],
+    top_merchants: list[tuple[str, dict]],
+    total_income: float,
+    total_expense: float,
+    net_flow: float,
+) -> list[str]:
+    """Call Gemini with an aggregated summary (no raw transactions) and
+    return a list of tips. ~150 tokens of input vs ~1500 before."""
+    cat_lines = "\n".join(
+        f"- {c}: {a:,.0f} ₪"
+        for c, a in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+        if a > 0
+    )
+    merchant_lines = "\n".join(
+        f"- {name}: {info['total']:,.0f} ₪ ({info['count']}x)"
+        for name, info in top_merchants[:6]
+    )
 
-Tips must be specific to what you saw, not generic."""
+    prompt = (
+        f"Israeli user's monthly statement (ILS):\n"
+        f"- Income: {total_income:,.0f}\n"
+        f"- Expenses: {total_expense:,.0f}\n"
+        f"- Net: {net_flow:+,.0f}\n\n"
+        f"Category breakdown:\n{cat_lines}\n\n"
+        f"Top merchants:\n{merchant_lines}\n\n"
+        f"Give 3-5 specific, actionable savings/optimisation tips in Hebrew, "
+        f"based on this data. Reply with ONLY a JSON array of Hebrew strings, "
+        f"no markdown, no backticks. Example: [\"tip 1\", \"tip 2\"]"
+    )
 
     loop = asyncio.get_event_loop()
-
     raw_text = None
-    last_error = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             raw_text = await loop.run_in_executor(None, lambda: _call_gemini(api_key, prompt))
             break
         except urllib.error.HTTPError as e:
-            last_error = e
-            if e.code == 429 and attempt < 2:
-                logger.warning(f"Rate limited, waiting 30s (attempt {attempt + 1})")
-                await asyncio.sleep(30)
+            if e.code == 429 and attempt < 1:
+                await asyncio.sleep(15)
             else:
-                break
-        except Exception as e:
-            last_error = e
-            break
+                raise
 
     if raw_text is None:
-        # Gemini unavailable — return a local report instead of crashing.
-        logger.error(f"Gemini failed: {last_error}")
-        return _format_report_no_ai(
-            expenses, incomes, max_summary_skipped,
-            total_expense, total_income, net_flow,
-            poalim_count, max_count, closing_balance, last_error,
-        )
+        return []
 
     clean = raw_text.strip()
     if clean.startswith("```"):
@@ -110,20 +142,30 @@ Tips must be specific to what you saw, not generic."""
     clean = clean.strip()
 
     try:
-        data = json.loads(clean)
-    except json.JSONDecodeError as e:
-        logger.error(f"Gemini returned non-JSON: {e} | raw={raw_text[:200]}")
-        return _format_report_no_ai(
-            expenses, incomes, max_summary_skipped,
-            total_expense, total_income, net_flow,
-            poalim_count, max_count, closing_balance, e,
-        )
+        tips = json.loads(clean)
+        if isinstance(tips, list):
+            return [str(t) for t in tips][:5]
+    except json.JSONDecodeError:
+        logger.warning(f"Gemini returned non-JSON tips: {raw_text[:200]}")
+    return []
 
-    return _format_report(
-        data, expenses, incomes, max_summary_skipped,
-        total_expense, total_income, net_flow,
-        poalim_count, max_count, closing_balance,
-    )
+
+async def test_gemini(api_key: str) -> tuple[bool, str]:
+    """Diagnostic helper. Returns (ok, message)."""
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: _call_gemini(api_key, "Reply with exactly: ok")
+        )
+        return True, result.strip()[:200]
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body = "<no body>"
+        return False, f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _call_gemini(api_key: str, prompt: str) -> str:
@@ -289,77 +331,21 @@ def _local_tips(
 
 
 def _format_report(
-    data: dict,
+    cat_totals: dict[str, float],
+    top_merchants: list[tuple[str, dict]],
+    tips: list[str],
     expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
     total_expense: float, total_income: float, net_flow: float,
     poalim_count: int, max_count: int,
     closing_balance: float | None,
+    ai_error: Exception | None,
 ) -> str:
-    categories = data.get("categories", {})
-    top_merchants = data.get("top_merchants", [])
-    tips = data.get("tips", [])
-    summary = data.get("summary", "")
-
     report = "📊 *דוח חודשי*\n\n"
-    report += _balance_section(closing_balance)
-    report += f"💳 סה\"כ הוצאות: *{total_expense:,.0f} ₪*\n"
-    report += f"   • פועלים עו\"ש: {poalim_count} תנועות\n"
-    report += f"   • מקס: {max_count} עסקאות\n\n"
 
-    report += _max_summary_note(max_summary_skipped)
-    report += _income_section(incomes, total_income)
-    report += _net_flow_section(total_income, total_expense, net_flow)
-
-    if categories:
-        report += "📂 *פילוח הוצאות:*\n"
-        for cat, amount in sorted(categories.items(), key=lambda x: x[1], reverse=True):
-            if amount <= 0:
-                continue
-            pct = (amount / total_expense * 100) if total_expense > 0 else 0
-            bar = "🔴" if pct >= 30 else ("🟡" if pct >= 15 else "🟢")
-            report += f"{bar} {cat}: *{amount:,.0f} ₪* ({pct:.0f}%)\n"
-        report += "\n"
-
-    if top_merchants:
-        report += "🏪 *בתי עסק מובילים:*\n"
-        for m in top_merchants[:5]:
-            report += f"   • {m['name']}: {m['total']:,.0f} ₪ ({m['count']} פעמים)\n"
-        report += "\n"
-
-    if summary:
-        report += f"💬 _{summary}_\n\n"
-
-    if not tips:
-        # Gemini didn't return tips — fall back to locally-derived ones so
-        # the user still gets actionable advice.
-        cat_totals = _local_categorise(expenses)
-        tips = _local_tips(expenses, total_expense, total_income, net_flow, cat_totals)
-
-    if tips:
-        report += "💡 *טיפים לחסכון:*\n"
-        for i, tip in enumerate(tips[:5], 1):
-            report += f"{i}. {tip}\n"
-
-    report += "\n\n_לניתוח חודש חדש: /reset_"
-    return report
-
-
-def _format_report_no_ai(
-    expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
-    total_expense: float, total_income: float, net_flow: float,
-    poalim_count: int, max_count: int,
-    closing_balance: float | None,
-    error: Exception | None,
-) -> str:
-    """Fallback report when Gemini is unavailable (quota / network).
-    Shows totals, income, net flow, locally-categorised expenses, and top
-    merchants computed locally."""
-    report = "📊 *דוח חודשי* _(ללא AI — פולבק מקומי)_\n\n"
-
-    if isinstance(error, urllib.error.HTTPError) and error.code == 429:
-        report += "⚠️ _חרגתי ממכסת ה-API של Gemini. הניתוח מתבסס על חישוב מקומי בלבד._\n\n"
-    elif error is not None:
-        report += "⚠️ _שירות ה-AI לא היה זמין. הניתוח מתבסס על חישוב מקומי בלבד._\n\n"
+    if isinstance(ai_error, urllib.error.HTTPError) and ai_error.code == 429:
+        report += "ℹ️ _AI הגיע למכסה — הקטגוריות והטיפים חושבו מקומית._\n\n"
+    elif ai_error is not None:
+        report += "ℹ️ _שירות ה-AI לא היה זמין — הקטגוריות והטיפים חושבו מקומית._\n\n"
 
     report += _balance_section(closing_balance)
     report += f"💳 סה\"כ הוצאות: *{total_expense:,.0f} ₪*\n"
@@ -370,10 +356,8 @@ def _format_report_no_ai(
     report += _income_section(incomes, total_income)
     report += _net_flow_section(total_income, total_expense, net_flow)
 
-    # Local categorisation
-    cat_totals = _local_categorise(expenses)
     if cat_totals and total_expense > 0:
-        report += "📂 *פילוח הוצאות (לפי כללים מקומיים):*\n"
+        report += "📂 *פילוח הוצאות:*\n"
         for cat, amount in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True):
             if amount <= 0:
                 continue
@@ -382,29 +366,20 @@ def _format_report_no_ai(
             report += f"{bar} {cat}: *{amount:,.0f} ₪* ({pct:.0f}%)\n"
         report += "\n"
 
-    # Local top-merchants: aggregate by description
-    by_desc: dict[str, dict] = {}
-    for t in expenses:
-        key = t["description"]
-        if key not in by_desc:
-            by_desc[key] = {"total": 0.0, "count": 0}
-        by_desc[key]["total"] += t["amount"]
-        by_desc[key]["count"] += 1
-
-    top = sorted(by_desc.items(), key=lambda x: x[1]["total"], reverse=True)[:5]
-    if top:
+    if top_merchants:
         report += "🏪 *בתי עסק מובילים:*\n"
-        for name, info in top:
+        for name, info in top_merchants[:5]:
             report += f"   • {name}: {info['total']:,.0f} ₪ ({info['count']} פעמים)\n"
         report += "\n"
 
-    tips = _local_tips(expenses, total_expense, total_income, net_flow, cat_totals)
     if tips:
         report += "💡 *טיפים לייעול:*\n"
-        for i, tip in enumerate(tips, 1):
+        for i, tip in enumerate(tips[:5], 1):
             report += f"{i}. {tip}\n"
         report += "\n"
 
     report += "_לעדכון קטגוריות (למשל \"שיק\" → שכר דירה): ערוך את categories.py בריפו._\n"
     report += "_לניתוח חודש חדש: /reset_"
     return report
+
+
