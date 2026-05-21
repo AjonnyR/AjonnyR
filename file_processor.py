@@ -41,21 +41,37 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
       Line 1: ##
       Line 2: ₪BALANCE  AMOUNT  DESCRIPTION(reversed)  DATE
 
-    The line number after ## (1 = credit/income, 2 = debit/expense)
-    appears on a third line but we use keyword filtering instead.
+    Poalim is the main account — money sits here and everything is debited
+    from it. We classify each transaction:
+      - income       : credits (salary, refunds, transfers in)
+      - max_summary  : the monthly Max credit-card debit (do NOT sum with
+                       the Max file rows — that would double-count)
+      - expense      : everything else
     """
-    # Match: ## newline then balance amount description date
     pattern = re.compile(
         r'##\n(₪[\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+(.+?)\s+(\d{2}/\d{2}/\d{4})'
     )
 
-    # Hebrew keywords that indicate INCOME — skip these
+    # Hebrew keywords (reversed, since pdfplumber returns text reversed)
+    # that indicate INCOME — credits to the account.
     INCOME_KEYWORDS = [
-        "תרוכשמ",      # משכורת
-        'ת"פומ',        # מופ"ת
-        "יוכיז",        # זיכוי
-        "קנעמ",         # מענק
-        "םירמושה תצובק", # קבוצת השומרים
+        "תרוכשמ",        # משכורת
+        'ת"פומ',          # מופ"ת
+        "יוכיז",          # זיכוי
+        "קנעמ",           # מענק
+        "םירמושה תצובק",  # קבוצת השומרים
+        "הרבעה",          # העברה (incoming transfer)
+        "רזחה",           # החזר
+        "תיביר",          # ריבית
+    ]
+
+    # Keywords identifying the monthly Max credit-card debit line in Poalim.
+    # When the Max file is also provided, this line is replaced by the
+    # per-merchant breakdown from Max, so we mark it separately.
+    MAX_SUMMARY_KEYWORDS = [
+        "סקמ",            # מקס
+        "יסנניפ טיא סקמ", # מקס איט פיננסי
+        "XAM",            # MAX
     ]
 
     transactions = []
@@ -63,25 +79,29 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
         amount_str = m.group(2)
         desc_raw = m.group(3).strip()
         date = m.group(4)
-
-        is_income = any(kw in desc_raw for kw in INCOME_KEYWORDS)
-        if is_income:
-            continue
-
         description = _fix_rtl(desc_raw)
 
         try:
             amount = float(amount_str.replace(",", ""))
             if amount <= 0 or amount > 200000:
                 continue
-            transactions.append({
-                "date": date,
-                "description": description,
-                "amount": amount,
-                "source": 'פועלים עו"ש'
-            })
         except ValueError:
             continue
+
+        if any(kw in desc_raw for kw in INCOME_KEYWORDS):
+            tx_type = "income"
+        elif any(kw in desc_raw for kw in MAX_SUMMARY_KEYWORDS):
+            tx_type = "max_summary"
+        else:
+            tx_type = "expense"
+
+        transactions.append({
+            "date": date,
+            "description": description,
+            "amount": amount,
+            "source": 'פועלים עו"ש',
+            "type": tx_type,
+        })
 
     return transactions
 
@@ -137,7 +157,8 @@ def process_excel(file_path: str) -> list[dict]:
                     "date": date,
                     "description": description,
                     "amount": amount,
-                    "source": "מקס"
+                    "source": "מקס",
+                    "type": "expense",
                 })
             except (ValueError, TypeError, IndexError) as e:
                 logger.debug(f"Skipped row: {e}")
@@ -181,7 +202,8 @@ def _parse_excel_generic(ws) -> list[dict]:
                 "date": date_found,
                 "description": desc_found or "לא ידוע",
                 "amount": amount_found,
-                "source": "מקס"
+                "source": "מקס",
+                "type": "expense",
             })
 
     return transactions
