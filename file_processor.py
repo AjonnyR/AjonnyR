@@ -54,24 +54,25 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
 
     # Hebrew keywords (reversed, since pdfplumber returns text reversed)
     # that indicate INCOME — credits to the account.
+    # NOTE: "העברה" is intentionally NOT here — it matches outgoing transfers
+    # too (e.g. "העברה לאחר נייד") and would mis-classify expenses as income.
     INCOME_KEYWORDS = [
         "תרוכשמ",        # משכורת
         'ת"פומ',          # מופ"ת
         "יוכיז",          # זיכוי
         "קנעמ",           # מענק
         "םירמושה תצובק",  # קבוצת השומרים
-        "הרבעה",          # העברה (incoming transfer)
         "רזחה",           # החזר
         "תיביר",          # ריבית
     ]
 
-    # Keywords identifying the monthly Max credit-card debit line in Poalim.
-    # When the Max file is also provided, this line is replaced by the
-    # per-merchant breakdown from Max, so we mark it separately.
-    MAX_SUMMARY_KEYWORDS = [
-        "סקמ",            # מקס
+    # Identifies the monthly Max credit-card debit line in the Poalim
+    # statement. We require the full distinctive phrase "מקס איט" (reversed:
+    # "טיא סקמ") — matching just "מקס"/"סקמ" caught dozens of unrelated rows
+    # (any word containing those 3 letters: מקסים, מקסי, etc).
+    MAX_SUMMARY_PATTERNS = [
+        "טיא סקמ",        # מקס איט   (the Max debit line in Hapoalim)
         "יסנניפ טיא סקמ", # מקס איט פיננסי
-        "XAM",            # MAX
     ]
 
     transactions = []
@@ -90,7 +91,7 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
 
         if any(kw in desc_raw for kw in INCOME_KEYWORDS):
             tx_type = "income"
-        elif any(kw in desc_raw for kw in MAX_SUMMARY_KEYWORDS):
+        elif any(kw in desc_raw for kw in MAX_SUMMARY_PATTERNS):
             tx_type = "max_summary"
         else:
             tx_type = "expense"
