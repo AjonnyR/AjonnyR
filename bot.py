@@ -6,6 +6,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from file_processor import process_pdf, process_excel
 from analyzer import analyze_expenses, test_gemini
+from categories import (
+    CATEGORY_RULES,
+    override as override_category,
+    persist as persist_categories,
+    persistence_enabled,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,14 +34,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *עזרה*\n\n"
-        "שלח לי קובץ PDF מפועלים וקובץ Excel ממקס.\n"
-        "אחרי ששני הקבצים יתקבלו, אני אנתח את ההוצאות שלך ואחזיר:\n\n"
-        "✅ פילוח הוצאות לפי קטגוריות\n"
-        "✅ גרף עוגה טקסטואלי של ההוצאות\n"
-        "✅ השוואה בין כרטיסי האשראי\n"
-        "✅ 3-5 טיפים חכמים לחסכון\n\n"
-        "לאיפוס ושליחה מחדש: /reset",
+        "📋 *פקודות זמינות*\n\n"
+        "/start — הסבר התחלתי\n"
+        "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
+        "/api — בדוק שמפתח Gemini עובד\n"
+        "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n\n"
+        "*שימוש רגיל:* שלח לי PDF של פועלים ו-Excel של מקס. אני אחזיר דוח "
+        "עם יתרה, הכנסות, הוצאות, פילוח קטגוריות, ובתי עסק מובילים.",
         parse_mode="Markdown"
     )
 
@@ -44,6 +49,63 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_files:
         del user_files[user_id]
     await update.message.reply_text("✅ איפסתי את הנתונים שלך. תוכל לשלוח קבצים חדשים.")
+
+
+async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User correction: /correct <description> = <category>
+
+    Saves to the in-memory LEARNED dict and, if GitHub is configured,
+    commits learned.json to the repo so the correction survives restarts.
+    """
+    raw = (update.message.text or "").split(None, 1)
+    text = raw[1].strip() if len(raw) == 2 else ""
+    if "=" not in text:
+        cats = ", ".join(CATEGORY_RULES.keys())
+        await update.message.reply_text(
+            "שימוש: /correct <תיאור> = <קטגוריה>\n\n"
+            f"קטגוריות אפשריות:\n{cats}",
+        )
+        return
+
+    desc, _, cat = text.partition("=")
+    desc, cat = desc.strip(), cat.strip()
+    if not desc or not cat:
+        await update.message.reply_text(
+            "❌ חסר תיאור או קטגוריה. שימוש: /correct <תיאור> = <קטגוריה>"
+        )
+        return
+
+    if not override_category(desc, cat):
+        cats = ", ".join(CATEGORY_RULES.keys())
+        await update.message.reply_text(
+            f"❌ הקטגוריה \"{cat}\" לא קיימת.\n\nקטגוריות אפשריות:\n{cats}"
+        )
+        return
+
+    await update.message.reply_text(f"✏️ עודכן בזיכרון: *{desc}* → *{cat}*\nשומר...", parse_mode="Markdown")
+
+    if persistence_enabled():
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(
+            None, persist_categories, f"User correction: {desc} → {cat}"
+        )
+        if ok:
+            await update.message.reply_text(
+                "✅ נשמר בריפו. Render יעלה גרסה חדשה בעוד 2-3 דקות "
+                "ואז התיקון יישאר לתמיד."
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ נשמר בזיכרון אבל ה-commit ל-GitHub נכשל — בדוק את ה-Logs ב-Render."
+            )
+    else:
+        await update.message.reply_text(
+            "ℹ️ התיקון בזיכרון בלבד — יעלם בהפעלה הבאה של הבוט.\n"
+            "להגדרת שמירה קבועה: הוסף ב-Render משתני סביבה "
+            "`GITHUB_TOKEN` (PAT עם הרשאת repo) ו-`GITHUB_REPO` "
+            "(`AjonnyR/AjonnyR`).",
+            parse_mode="Markdown",
+        )
 
 
 async def api_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,6 +210,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("correct", correct))
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 

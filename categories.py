@@ -77,15 +77,31 @@ def categorize(description: str) -> str:
     return "אחר"
 
 
-# In-memory cache of merchant → category learned from AI in past calls.
-# Survives across requests within the same Render container instance;
-# wiped on cold start (sleep + wake / redeploy). To persist across cold
-# starts, copy entries from the bot's report into CATEGORY_RULES above.
+# In-memory cache of merchant → category. Populated from learned.json on
+# startup (if GITHUB_TOKEN+GITHUB_REPO are set) and updated as AI learns
+# new merchants or the user runs /correct. Without GitHub configured the
+# dict is in-memory only and resets when the Render container restarts.
 LEARNED: dict[str, str] = {}
 
 
+def _load_from_store() -> None:
+    """Best-effort load from GitHub on import. Failures don't crash the bot."""
+    try:
+        import learning_store
+        loaded = learning_store.load()
+        if loaded:
+            LEARNED.update(loaded)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Couldn't load LEARNED: {e}")
+
+
+_load_from_store()
+
+
 def learn(description: str, category: str) -> bool:
-    """Record an AI categorisation for future reuse. Returns True if new."""
+    """Record a categorisation for future reuse. Returns True if it's new
+    (i.e. wasn't already cached and isn't covered by a static rule)."""
     if category not in CATEGORY_RULES:
         return False
     if LEARNED.get(description) == category:
@@ -95,13 +111,41 @@ def learn(description: str, category: str) -> bool:
     for cat, keywords in CATEGORY_RULES.items():
         for kw in keywords:
             if kw.lower() in desc_lower:
-                # Static rule would have caught this anyway; only store if
-                # the AI disagrees with the rule.
                 if cat == category:
                     return False
                 break
     LEARNED[description] = category
     return True
+
+
+def override(description: str, category: str) -> bool:
+    """User correction. Records the mapping even if a static rule would
+    have matched — the user's verdict always wins. Returns True on
+    success, False if the category name isn't recognised."""
+    if category not in CATEGORY_RULES:
+        return False
+    LEARNED[description] = category
+    return True
+
+
+def persist(commit_message: str) -> bool:
+    """Try to commit the current LEARNED dict to GitHub. Returns True on
+    success, False if persistence is disabled or the commit failed."""
+    try:
+        import learning_store
+        return learning_store.save(LEARNED, commit_message)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"persist failed: {e}")
+        return False
+
+
+def persistence_enabled() -> bool:
+    try:
+        import learning_store
+        return learning_store.enabled()
+    except Exception:
+        return False
 
 
 def get_learned() -> dict[str, str]:

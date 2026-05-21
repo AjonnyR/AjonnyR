@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import time
 
-from categories import categorize, learn, get_learned, CATEGORY_RULES
+from categories import categorize, learn, persist, get_learned, CATEGORY_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,16 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
         except Exception as e:
             ai_error = e
             logger.error(f"Gemini analysis failed: {e}")
+
+    # Persist newly-learned categories to GitHub if configured (a single
+    # commit per upload). Off-thread so we don't block the response.
+    if newly_learned:
+        msg = f"Learn {len(newly_learned)} new {'category' if len(newly_learned) == 1 else 'categories'} from AI"
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, persist, msg)
+        except Exception as e:
+            logger.warning(f"persist after analyze failed: {e}")
 
     # Build per-transaction category using AI's answer first, then the
     # categorize() chain (LEARNED → static rules → "אחר").
