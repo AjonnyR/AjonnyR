@@ -5,6 +5,7 @@ import logging
 import urllib.request
 import urllib.error
 import time
+from datetime import datetime
 
 from categories import categorize, learn, persist, get_learned, CATEGORY_RULES
 
@@ -296,7 +297,97 @@ def _max_summary_note(max_summary_skipped: list[dict]) -> str:
 
 
 def _cal_summary_note(cal_summary_skipped: list[dict]) -> str:
-    return _summary_note(cal_summary_skipped, "כאל", "תמונות כאל")
+    return _summary_note(cal_summary_skipped, "כאל", "קובץ כאל")
+
+
+def _parse_dmy(s: str) -> datetime:
+    """Parse DD/MM/YYYY → datetime; falls back to epoch on garbage."""
+    try:
+        return datetime.strptime(s, "%d/%m/%Y")
+    except (ValueError, TypeError):
+        return datetime(1970, 1, 1)
+
+
+def _verify_card(
+    skipped_summaries: list[dict],
+    breakdown_transactions: list[dict],
+    card_name: str,
+) -> str:
+    """Cross-check the breakdown file (Max/Cal Excel) against Hapoalim.
+
+    Strategy: walk the Hapoalim card-debit lines most-recent-first,
+    accumulating their amounts until the running sum matches the
+    breakdown total within tolerance (±5 ₪ or ±0.5%, whichever larger).
+    If a prefix matches → ✅ with the date range. Otherwise → ⚠️ with the
+    delta so the user can see what's missing.
+    """
+    if not skipped_summaries or not breakdown_transactions:
+        return ""
+
+    breakdown_total = sum(t["amount"] for t in breakdown_transactions)
+    tolerance = max(5.0, abs(breakdown_total) * 0.005)
+
+    # Most-recent-first matches the user's mental model: "the latest
+    # Excel covers the latest debit(s)".
+    summaries_sorted = sorted(
+        skipped_summaries, key=lambda t: _parse_dmy(t["date"]), reverse=True
+    )
+
+    running = 0.0
+    used: list[dict] = []
+    matched = False
+    for t in summaries_sorted:
+        running += t["amount"]
+        used.append(t)
+        if abs(running - breakdown_total) <= tolerance:
+            matched = True
+            break
+        if running > breakdown_total + tolerance:
+            break
+
+    if matched:
+        dates_sorted = sorted({t["date"] for t in used}, key=_parse_dmy)
+        if len(dates_sorted) == 1:
+            date_str = dates_sorted[0]
+        else:
+            date_str = f"{dates_sorted[0]}–{dates_sorted[-1]}"
+        return (
+            f"✅ *{card_name}:* {breakdown_total:,.2f} ₪ בקובץ — "
+            f"תואם ל-{len(used)} חיוב{'י' if len(used) > 1 else ''} בפועלים "
+            f"({date_str}).\n"
+        )
+
+    # No prefix matched. Report the closest sub-sum so the user can see
+    # whether they need to upload another month or whether transactions
+    # are missing from the Excel.
+    summaries_total = sum(t["amount"] for t in skipped_summaries)
+    delta = breakdown_total - summaries_total
+    return (
+        f"⚠️ *{card_name}:* קובץ {card_name} {breakdown_total:,.2f} ₪, "
+        f"סה\"כ חיובי {card_name} בעו\"ש {summaries_total:,.2f} ₪ "
+        f"(פער {delta:+,.2f} ₪). ייתכן שיש עסקאות חסרות בקובץ או "
+        f"שעו\"ש מכסה תקופה אחרת מהקובץ.\n"
+    )
+
+
+def _verification_section(
+    max_summary_skipped: list[dict],
+    cal_summary_skipped: list[dict],
+    max_breakdown: list[dict],
+    cal_breakdown: list[dict],
+) -> str:
+    """Build the self-check section comparing each card breakdown to the
+    matching Hapoalim debits. Skipped when nothing to check."""
+    lines = []
+    line = _verify_card(max_summary_skipped, max_breakdown, "מקס")
+    if line:
+        lines.append(line)
+    line = _verify_card(cal_summary_skipped, cal_breakdown, "כאל")
+    if line:
+        lines.append(line)
+    if not lines:
+        return ""
+    return "🧮 *בדיקה עצמית של הבוט:*\n" + "".join(lines) + "\n"
 
 
 def _net_flow_section(total_income: float, total_expense: float, net_flow: float) -> str:
@@ -437,6 +528,15 @@ def _format_report(
 
     report += _max_summary_note(max_summary_skipped)
     report += _cal_summary_note(cal_summary_skipped)
+
+    # Bot self-check: card breakdown totals vs Hapoalim debit lines.
+    max_breakdown = [t for t in expenses if t.get("source") == "מקס"]
+    cal_breakdown = [t for t in expenses if t.get("source") == "כאל פועלים"]
+    report += _verification_section(
+        max_summary_skipped, cal_summary_skipped,
+        max_breakdown, cal_breakdown,
+    )
+
     report += _income_section(incomes, total_income)
     report += _net_flow_section(total_income, total_expense, net_flow)
 

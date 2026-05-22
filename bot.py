@@ -34,10 +34,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "שלום! 👋 אני הבוט שיעזור לך לעקוב אחרי הכסף שלך.\n\n"
         "📤 *שלושת הקבצים שאני צריך:*\n"
         "1️⃣ PDF של *עו\"ש פועלים* (תנועות בחשבון)\n"
-        "2️⃣ PDF של *חיובי כרטיס כאל פועלים* (פירוט חיובים קודמים)\n"
-        "3️⃣ Excel של *מקס* (חיובי כרטיס אשראי)\n\n"
+        "2️⃣ Excel של *כאל פועלים* (פירוט חיובי כרטיס)\n"
+        "3️⃣ Excel של *מקס* (פירוט חיובי כרטיס)\n\n"
         "ברגע ששלושתם הגיעו אני אריץ ניתוח אוטומטית — בלי כפילויות בין "
-        "סיכומי הכרטיסים שבעו\"ש לבין הפירוטים שבקבצים הנפרדים.\n\n"
+        "סיכומי הכרטיסים שבעו\"ש לבין הפירוטים שבקבצים הנפרדים. "
+        "אני גם אבדוק שכל סיכום בעו\"ש תואם לסך הכרטיס המתאים.\n\n"
         "אפשר לשלוח את הקבצים בכל סדר. אם יש לך רק חלק מהם — שלח /analyze "
         "כדי להריץ עם מה שיש.",
         parse_mode="Markdown"
@@ -54,7 +55,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n\n"
         "*שימוש רגיל:* שלח לי שלושה קבצים:\n"
         "1️⃣ PDF של עו\"ש פועלים\n"
-        "2️⃣ PDF של חיובי כרטיס פועלים (כאל)\n"
+        "2️⃣ Excel של כאל פועלים\n"
         "3️⃣ Excel של מקס\n\n"
         "כשכל השלושה הגיעו אני אנתח אוטומטית. הסדר לא משנה.",
         parse_mode="Markdown"
@@ -199,7 +200,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_files[user_id] = {}
 
     if file_name.endswith(".pdf"):
-        await update.message.reply_text("📥 קיבלתי PDF — מזהה סוג...")
+        await update.message.reply_text("📥 קיבלתי PDF — מעבד את עו\"ש פועלים...")
         file = await context.bot.get_file(doc.file_id)
         file_path = os.path.join(TMP, f"{user_id}_{file.file_unique_id}.pdf")
         await file.download_to_drive(file_path)
@@ -207,47 +208,50 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         transactions, closing_balance, pdf_type = process_pdf(file_path)
         if pdf_type == "unknown" or not transactions:
             await update.message.reply_text(
-                "⚠️ לא הצלחתי לקרוא עסקאות מה-PDF. ודא שזה PDF של עו\"ש "
-                "פועלים או של חיובי כאל פועלים."
+                "⚠️ לא הצלחתי לקרוא עסקאות מה-PDF. ודא שזה PDF של עו\"ש פועלים."
             )
             return
 
-        if pdf_type == "cal":
-            user_files[user_id]["cal"] = transactions
-            total = sum(t["amount"] for t in transactions)
-            await update.message.reply_text(
-                f"✅ עיבדתי PDF של כאל פועלים — *{len(transactions)}* "
-                f"עסקאות (סה\"כ {total:,.0f} ₪).",
-                parse_mode="Markdown",
-            )
-        else:  # poalim
-            user_files[user_id]["poalim"] = transactions
-            user_files[user_id]["closing_balance"] = closing_balance
-            await update.message.reply_text(
-                f"✅ עיבדתי PDF של עו\"ש פועלים — *{len(transactions)}* תנועות.",
-                parse_mode="Markdown",
-            )
+        user_files[user_id]["poalim"] = transactions
+        user_files[user_id]["closing_balance"] = closing_balance
+        await update.message.reply_text(
+            f"✅ עיבדתי PDF של עו\"ש פועלים — *{len(transactions)}* תנועות.",
+            parse_mode="Markdown",
+        )
 
     elif file_name.endswith((".xlsx", ".xls")):
-        await update.message.reply_text("📥 קיבלתי קובץ מקס! מעבד...")
+        await update.message.reply_text("📥 קיבלתי Excel — מזהה אם מקס או כאל...")
         file = await context.bot.get_file(doc.file_id)
-        file_path = os.path.join(TMP, f"{user_id}_max.xlsx")
+        file_path = os.path.join(TMP, f"{user_id}_{file.file_unique_id}.xlsx")
         await file.download_to_drive(file_path)
 
         transactions = process_excel(file_path)
         if not transactions:
-            await update.message.reply_text("⚠️ לא הצלחתי לקרוא עסקאות מה-Excel. ודא שזה קובץ מקס תקין.")
+            await update.message.reply_text(
+                "⚠️ לא הצלחתי לקרוא עסקאות מה-Excel. ודא שזה קובץ מקס או כאל פועלים תקין."
+            )
             return
 
-        user_files[user_id]["max"] = transactions
-        await update.message.reply_text(
-            f"✅ עיבדתי קובץ מקס — *{len(transactions)}* עסקאות.",
-            parse_mode="Markdown",
-        )
+        source = transactions[0].get("source", "")
+        total = sum(t["amount"] for t in transactions)
+        if source == "כאל פועלים":
+            user_files[user_id]["cal"] = transactions
+            await update.message.reply_text(
+                f"✅ עיבדתי קובץ כאל פועלים — *{len(transactions)}* "
+                f"עסקאות (סה\"כ {total:,.0f} ₪).",
+                parse_mode="Markdown",
+            )
+        else:
+            user_files[user_id]["max"] = transactions
+            await update.message.reply_text(
+                f"✅ עיבדתי קובץ מקס — *{len(transactions)}* "
+                f"עסקאות (סה\"כ {total:,.0f} ₪).",
+                parse_mode="Markdown",
+            )
 
     else:
         await update.message.reply_text(
-            "❌ סוג קובץ לא מזוהה. שלח PDF (עו\"ש פועלים או חיובי כאל) או Excel ממקס."
+            "❌ סוג קובץ לא מזוהה. שלח PDF של עו\"ש פועלים או Excel של מקס/כאל."
         )
         return
 
