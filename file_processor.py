@@ -85,6 +85,9 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
         "טיא סקמ",        # מקס איט   (the Max debit line in Hapoalim)
         "יסנניפ טיא סקמ", # מקס איט פיננסי
     ]
+    # Cal credit card monthly debit line. The description in the PDF after
+    # RTL fix is exactly "כאל". Reversed in the raw text: "לאכ".
+    CAL_SUMMARY_DESCRIPTIONS = {"כאל"}
 
     transactions = []
     balances_by_date: list[tuple[datetime, float]] = []
@@ -114,6 +117,8 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
             tx_type = "income"
         elif any(kw in desc_raw for kw in MAX_SUMMARY_PATTERNS):
             tx_type = "max_summary"
+        elif description in CAL_SUMMARY_DESCRIPTIONS:
+            tx_type = "cal_summary"
         else:
             tx_type = "expense"
 

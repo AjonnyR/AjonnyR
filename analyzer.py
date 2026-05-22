@@ -28,15 +28,17 @@ async def analyze_full(
     The caller can use this list to offer the user inline buttons to fix
     them.
     """
-    # Poalim is the main account. The monthly "Max" debit line in Poalim
-    # is just a summary of the per-merchant rows in the Max file — if we
-    # also got the Max file, exclude those summary lines from the totals
-    # to avoid double-counting.
+    # Poalim is the main account. Monthly "Max" / "Cal" debit lines in
+    # Poalim are just summaries of the per-merchant rows in those cards'
+    # own files — if we also got the breakdown (Max Excel or Cal images),
+    # exclude the summary lines to avoid double-counting.
     has_max_file = any(t.get("source") == "מקס" for t in transactions)
+    has_cal_data = any(t.get("source") == "כאל פועלים" for t in transactions)
 
     expenses: list[dict] = []
     incomes: list[dict] = []
     max_summary_skipped: list[dict] = []
+    cal_summary_skipped: list[dict] = []
     for t in transactions:
         ttype = t.get("type", "expense")
         if ttype == "income":
@@ -46,6 +48,11 @@ async def analyze_full(
                 max_summary_skipped.append(t)
             else:
                 expenses.append(t)
+        elif ttype == "cal_summary":
+            if has_cal_data:
+                cal_summary_skipped.append(t)
+            else:
+                expenses.append(t)
         else:
             expenses.append(t)
 
@@ -53,8 +60,9 @@ async def analyze_full(
     total_income = sum(t["amount"] for t in incomes)
     net_flow = total_income - total_expense
 
-    poalim_count = sum(1 for t in expenses if "פועלים" in t["source"])
+    poalim_count = sum(1 for t in expenses if "פועלים" in t["source"] and t["source"] != "כאל פועלים")
     max_count = sum(1 for t in expenses if t["source"] == "מקס")
+    cal_count = sum(1 for t in expenses if t["source"] == "כאל פועלים")
 
     # Merchant aggregation (always local — pure math)
     by_desc: dict[str, dict] = {}
@@ -121,9 +129,9 @@ async def analyze_full(
 
     report = _format_report(
         cat_totals, top_merchants, tips, newly_learned,
-        expenses, incomes, max_summary_skipped,
+        expenses, incomes, max_summary_skipped, cal_summary_skipped,
         total_expense, total_income, net_flow,
-        poalim_count, max_count, closing_balance,
+        poalim_count, max_count, cal_count, closing_balance,
         ai_error if not ai_categories else None,
     )
 
@@ -215,6 +223,111 @@ async def _get_ai_analysis(
     return cats, tips
 
 
+async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[dict]:
+    """Extract transactions from a credit-card screenshot using Gemini Vision.
+
+    Returns a list of {date, description, amount, source, type} dicts ready
+    to merge with the rest of the user's transactions. The source is set
+    to "כאל פועלים" so downstream code treats them as that card's break-
+    down (which dedups the cal_summary lines in the Hapoalim PDF).
+
+    Raises if GEMINI_API_KEY isn't set or the call fails.
+    """
+    import base64
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set")
+
+    prompt = (
+        "This is a screenshot from an Israeli credit-card transaction list "
+        "(likely from the Hapoalim mobile app, Cal-branded card). Each row "
+        "shows date, merchant name in Hebrew, and amount in ILS.\n\n"
+        "Extract every transaction visible. Reply with ONLY a JSON array, "
+        "no markdown, no backticks:\n"
+        '[{"date": "DD/MM/YYYY", "description": "<hebrew merchant>", "amount": 1234.56}, ...]\n\n'
+        "Rules:\n"
+        "- Use the date the user was charged (תאריך עסקה or תאריך חיוב — "
+        "whichever is shown).\n"
+        "- Use Hebrew text exactly as shown for merchant names.\n"
+        "- Amount is a positive number in ILS, even if the screen shows it "
+        "with a minus sign.\n"
+        "- For installments (תשלום X מתוך Y), use the per-installment amount, "
+        "not the total — that's what was actually charged this month.\n"
+        "- Skip headers, totals, balance lines, navigation chrome — only "
+        "transaction rows.\n"
+        "- If you can't read a field confidently, omit that transaction."
+    )
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64}},
+            ],
+        }],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
+    }
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    loop = asyncio.get_event_loop()
+
+    def _call() -> str:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+
+    raw = await loop.run_in_executor(None, _call)
+
+    clean = raw.strip()
+    if clean.startswith("```"):
+        clean = clean.split("```")[1]
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip()
+
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError:
+        logger.warning(f"OCR returned non-JSON: {raw[:300]}")
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    transactions: list[dict] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            amount = float(row.get("amount", 0))
+            if amount <= 0 or amount > 200000:
+                continue
+            date = str(row.get("date", "")).strip()
+            desc = str(row.get("description", "")).strip() or "לא ידוע"
+            if not date:
+                continue
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "amount": amount,
+                "source": "כאל פועלים",
+                "type": "expense",
+            })
+        except (ValueError, TypeError):
+            continue
+
+    logger.info(f"OCR: extracted {len(transactions)} transactions from image")
+    return transactions
+
+
 async def test_gemini(api_key: str) -> tuple[bool, str]:
     """Diagnostic helper. Returns (ok, message)."""
     loop = asyncio.get_event_loop()
@@ -271,15 +384,24 @@ def _income_section(incomes: list[dict], total_income: float) -> str:
     return section + "\n"
 
 
-def _max_summary_note(max_summary_skipped: list[dict]) -> str:
-    if not max_summary_skipped:
+def _summary_note(skipped: list[dict], card_name: str, source_name: str) -> str:
+    if not skipped:
         return ""
-    total = sum(t["amount"] for t in max_summary_skipped)
-    note = "ℹ️ _זיהיתי "
-    note += f"{len(max_summary_skipped)} חיוב{'י' if len(max_summary_skipped) > 1 else ''} מקס בפועלים "
-    note += f"(סה\"כ {total:,.0f} ₪) — לא נספרו פעמיים, "
-    note += "הפירוט נלקח מקובץ מקס._\n\n"
-    return note
+    total = sum(t["amount"] for t in skipped)
+    plural = "י" if len(skipped) > 1 else ""
+    return (
+        f"ℹ️ _זיהיתי {len(skipped)} חיוב{plural} {card_name} בפועלים "
+        f"(סה\"כ {total:,.0f} ₪) — לא נספרו פעמיים, "
+        f"הפירוט נלקח מ{source_name}._\n\n"
+    )
+
+
+def _max_summary_note(max_summary_skipped: list[dict]) -> str:
+    return _summary_note(max_summary_skipped, "מקס", "קובץ מקס")
+
+
+def _cal_summary_note(cal_summary_skipped: list[dict]) -> str:
+    return _summary_note(cal_summary_skipped, "כאל", "תמונות כאל")
 
 
 def _net_flow_section(total_income: float, total_expense: float, net_flow: float) -> str:
@@ -395,9 +517,10 @@ def _format_report(
     top_merchants: list[tuple[str, dict]],
     tips: list[str],
     newly_learned: dict[str, str],
-    expenses: list[dict], incomes: list[dict], max_summary_skipped: list[dict],
+    expenses: list[dict], incomes: list[dict],
+    max_summary_skipped: list[dict], cal_summary_skipped: list[dict],
     total_expense: float, total_income: float, net_flow: float,
-    poalim_count: int, max_count: int,
+    poalim_count: int, max_count: int, cal_count: int,
     closing_balance: float | None,
     ai_error: Exception | None,
 ) -> str:
@@ -411,9 +534,14 @@ def _format_report(
     report += _balance_section(closing_balance)
     report += f"💳 סה\"כ הוצאות: *{total_expense:,.0f} ₪*\n"
     report += f"   • פועלים עו\"ש: {poalim_count} תנועות\n"
-    report += f"   • מקס: {max_count} עסקאות\n\n"
+    if max_count:
+        report += f"   • מקס: {max_count} עסקאות\n"
+    if cal_count:
+        report += f"   • כאל פועלים: {cal_count} עסקאות\n"
+    report += "\n"
 
     report += _max_summary_note(max_summary_skipped)
+    report += _cal_summary_note(cal_summary_skipped)
     report += _income_section(incomes, total_income)
     report += _net_flow_section(total_income, total_expense, net_flow)
 
