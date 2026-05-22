@@ -357,16 +357,25 @@ def _verify_card(
             f"({date_str}).\n"
         )
 
-    # No prefix matched. Report the closest sub-sum so the user can see
-    # whether they need to upload another month or whether transactions
-    # are missing from the Excel.
-    summaries_total = sum(t["amount"] for t in skipped_summaries)
-    delta = breakdown_total - summaries_total
+    # No exact prefix matched. Show the closest cluster (the lines we
+    # walked through before overshooting), NOT the full PDF total — the
+    # user's Hapoalim usually covers several months, so reporting the
+    # multi-month grand total would be misleading.
+    if not used:
+        return ""
+    cluster_total = sum(t["amount"] for t in used)
+    cluster_dates = sorted({t["date"] for t in used}, key=_parse_dmy)
+    date_str = (
+        cluster_dates[0] if len(cluster_dates) == 1
+        else f"{cluster_dates[0]}–{cluster_dates[-1]}"
+    )
+    delta = breakdown_total - cluster_total
+    plural = "י" if len(used) > 1 else ""
     return (
-        f"⚠️ *{card_name}:* קובץ {card_name} {breakdown_total:,.2f} ₪, "
-        f"סה\"כ חיובי {card_name} בעו\"ש {summaries_total:,.2f} ₪ "
-        f"(פער {delta:+,.2f} ₪). ייתכן שיש עסקאות חסרות בקובץ או "
-        f"שעו\"ש מכסה תקופה אחרת מהקובץ.\n"
+        f"⚠️ *{card_name}:* קובץ {card_name} {breakdown_total:,.2f} ₪; "
+        f"{len(used)} חיוב{plural} בעו\"ש ({date_str}) = "
+        f"{cluster_total:,.2f} ₪. פער {delta:+,.2f} ₪ — "
+        f"ייתכן שחסרות עסקאות בקובץ (למשל כרטיסי משפחה נוספים).\n"
     )
 
 
