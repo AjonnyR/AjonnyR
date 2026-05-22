@@ -13,51 +13,16 @@ wins. Put more specific categories above more generic ones.
 import os
 
 CATEGORY_RULES: dict[str, list[str]] = {
-    "דיור ושכירות": [
-        "שכר דירה", "ארנונה", "ועד בית", "חברת חשמל", "מי אביבים",
-        "תאגיד מים",
-        # Pay rent by check? Uncomment the next line to send all checks here:
-        # "שיק",
-    ],
-    "מזון וסופרמרקט": [
-        "שופרסל", "רמי לוי", "סופר", "יוחננוף", "ויקטורי", "מגה",
-        "טיב טעם", "אושר עד", "יינות ביתן", "סטופ מרקט", "מחסני השוק",
-    ],
-    "מסעדות ובתי קפה": [
-        "מסעדה", "קפה", "פיצה", "המבורגר", "מקדונלדס", "burger",
-        "ארומה", "קופי", "wolt", "10bis", "tenbis",
-    ],
-    "תחבורה ודלק": [
-        "דלק", "פז", "סונול", "תדלוק", "דור אלון", "ten", "טן",
-        "פנגו", "pango", "סלופארק", "cellopark",
-        "אגד", "רכבת", "כביש 6", "כביש6", "חניון", "מונית",
-    ],
-    "קניות ואופנה": [
-        "זארה", "zara", "H&M", "קסטרו", "פוקס", "טרמינל איקס",
-        "הום סנטר", "איקאה", "ikea", "ace",
-    ],
-    "בריאות ופארמה": [
-        "סופר פארם", "ניו פארם", "מכבי", "כללית", "מאוחדת", "לאומית",
-        "בית מרקחת", "טרם", "פארמה",
-    ],
-    "בילוי ופנאי": [
-        "סינמה", "יס פלאנט", "yes planet", "הוט סינמה", "נטפליקס",
-        "netflix", "spotify", "ספוטיפיי", "חדר כושר", "gym",
-    ],
-    "חינוך": [
-        "גן ילדים", "בית ספר", "אוניברסיטה", "מכללה", "צהרון",
-    ],
-    "תקשורת וסלולר": [
-        "סלקום", "פרטנר", "פלאפון", "בזק", "012", "019", "hot",
-    ],
-    "ביטוח ופיננסים": [
-        "ביטוח", "כלל", "הראל", "מנורה", "מגדל", "פניקס",
-        "ביטוח לאומי", "מס הכנסה", "כאל", "ויזה",
-    ],
-    "העברות ותשלומים": [
-        "העברה", "העב'", "שיק", "שיקים", "ביט", "paybox", "bit",
-        "משיכה", "בנקט",
-    ],
+    # Three user-defined base categories. Keyword lists are intentionally
+    # empty — every merchant is categorised by Gemini (or by user
+    # /correct / button taps) on first sight, then cached in LEARNED.
+    # Add more categories at runtime with /newcategory.
+    "אוכל": [],
+    "קטנוע": [],
+    "אלי ואמז": [],
+    # System fallback: where the AI lands a merchant it can't slot
+    # confidently, and where /deletecategory moves orphan merchants.
+    # Always present.
     "אחר": [],
 }
 

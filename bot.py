@@ -1,5 +1,7 @@
 import os
 import asyncio
+import html
+import re
 import tempfile
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -262,30 +264,44 @@ async def delete_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _strip_html(s: str) -> str:
+    """Plain-text fallback if HTML rendering fails (rare but possible)."""
+    return _HTML_TAG.sub("", s)
+
+
 async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/categories  —  list every category and what's in it."""
+    """/categories  —  list every category and what's in it.
+
+    Uses HTML rather than Markdown because merchant names commonly
+    contain '*' (e.g. "AMAZON MKTPL*BS64T7N90"), which Markdown would
+    interpret as an unmatched bold marker and Telegram would reject
+    the whole message."""
     rows = list_all_with_contents()
     if not rows:
         await update.message.reply_text("אין קטגוריות מוגדרות.")
         return
 
-    # Build sections; flush when approaching Telegram's 4096-char limit.
+    def esc(s: str) -> str:
+        return html.escape(s, quote=False)
+
     MAX_LEN = 3800
     chunks: list[str] = []
-    current = "📂 *קטגוריות וקטלוגים*\n\n"
+    current = "📂 <b>קטגוריות</b>\n\n"
     for cat, keywords, merchants, is_custom in rows:
-        header = f"*{cat}*" + (" 🆕" if is_custom else "")
+        header = f"<b>{esc(cat)}</b>" + (" 🆕" if is_custom else "")
         block = f"{header}\n"
         if keywords:
-            block += f"   🔑 _{len(keywords)} מילות מפתח (בקוד)_\n"
+            block += f"   🔑 <i>{len(keywords)} מילות מפתח (בקוד)</i>\n"
         if merchants:
-            shown = merchants[:15]
-            for m in shown:
-                block += f"   • {m}\n"
+            for m in merchants[:15]:
+                block += f"   • {esc(m)}\n"
             if len(merchants) > 15:
-                block += f"   • _ועוד {len(merchants) - 15} עסקאות..._\n"
+                block += f"   • <i>ועוד {len(merchants) - 15} עסקאות...</i>\n"
         elif not keywords:
-            block += "   _(ריקה)_\n"
+            block += "   <i>(ריקה)</i>\n"
         block += "\n"
 
         if len(current) + len(block) > MAX_LEN:
@@ -297,11 +313,15 @@ async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks.append(current)
 
     chunks[-1] += (
-        "_🆕 = נוצרה על ידך. ליצירת קטגוריה חדשה: /newcategory <שם>_\n"
-        "_לתיוג מסחר לקטגוריה: /correct <תיאור> = <קטגוריה>_"
+        "<i>🆕 = נוצרה על ידך. ליצירת קטגוריה חדשה: /newcategory &lt;שם&gt;</i>\n"
+        "<i>לתיוג מסחר: /correct &lt;תיאור&gt; = &lt;קטגוריה&gt;</i>"
     )
     for chunk in chunks:
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(chunk, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"/categories HTML send failed, falling back to plain: {e}")
+            await update.message.reply_text(_strip_html(chunk))
 
 
 async def flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
