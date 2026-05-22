@@ -77,8 +77,13 @@ def _friendly(code: int, body: str) -> str:
     return body[:200]
 
 
-def load() -> dict[str, str]:
-    """Fetch learned.json from the repo. Returns {} if nothing's there yet."""
+def load() -> dict:
+    """Fetch learned.json from the repo. Returns {} if nothing's there yet.
+
+    The returned dict contains merchant→category strings PLUS, optionally,
+    a `__categories__` key whose value is the list of user-created
+    category names. The caller (categories.py) is responsible for
+    separating the two."""
     cfg = _config()
     if not cfg:
         return {}
@@ -95,13 +100,13 @@ def load() -> dict[str, str]:
         content = base64.b64decode(result["content"]).decode("utf-8")
         data = json.loads(content)
         if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
+            return data
     except Exception as e:
         logger.warning(f"learning_store.load couldn't parse {path}: {e}")
     return {}
 
 
-def save(learned: dict[str, str], commit_message: str) -> tuple[bool, str | None]:
+def save(learned: dict, commit_message: str) -> tuple[bool, str | None]:
     """Commit the full LEARNED dict to learned.json. Triggers a Render
     auto-redeploy. Returns (True, None) on success, (False, reason) on
     failure (reason is a human-readable Hebrew string)."""

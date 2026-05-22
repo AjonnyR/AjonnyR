@@ -85,20 +85,84 @@ def categorize(description: str) -> str:
 # dict is in-memory only and resets when the Render container restarts.
 LEARNED: dict[str, str] = {}
 
+# User-created categories that aren't in the static CATEGORY_RULES above.
+# Persisted in the same learned.json file under the reserved key
+# `__categories__` so creating a category doesn't cost a second commit.
+CUSTOM_CATEGORIES: list[str] = []
+
+# Reserved key inside learned.json — must not collide with merchant names.
+_CATEGORIES_KEY = "__categories__"
+
 
 def _load_from_store() -> None:
     """Best-effort load from GitHub on import. Failures don't crash the bot."""
     try:
         import learning_store
         loaded = learning_store.load()
-        if loaded:
-            LEARNED.update(loaded)
+        if not loaded:
+            return
+        # Split: list under __categories__ = user-created category names;
+        # string values = merchant → category mappings.
+        custom = loaded.get(_CATEGORIES_KEY, [])
+        if isinstance(custom, list):
+            for name in custom:
+                if isinstance(name, str) and name and name not in CATEGORY_RULES:
+                    CATEGORY_RULES[name] = []
+                    CUSTOM_CATEGORIES.append(name)
+        for k, v in loaded.items():
+            if k == _CATEGORIES_KEY:
+                continue
+            if isinstance(v, str):
+                LEARNED[str(k)] = v
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Couldn't load LEARNED: {e}")
 
 
 _load_from_store()
+
+
+def _build_save_dict() -> dict:
+    """Construct the dict that goes into learned.json: all learned
+    mappings PLUS the custom-categories list under the reserved key."""
+    out: dict = dict(LEARNED)
+    if CUSTOM_CATEGORIES:
+        out[_CATEGORIES_KEY] = sorted(set(CUSTOM_CATEGORIES))
+    return out
+
+
+def create_category(name: str) -> tuple[bool, str | None]:
+    """Add a new user-defined category. Returns (True, None) on success,
+    (False, reason) if the name is invalid or already exists. The change
+    must still be persisted via schedule_persist()."""
+    name = name.strip()
+    if not name:
+        return False, "שם הקטגוריה ריק"
+    if len(name) > 30:
+        return False, "שם ארוך מדי (מקסימום 30 תווים)"
+    if name == _CATEGORIES_KEY or name.startswith("__"):
+        return False, "השם הזה שמור — בחר אחר"
+    if name in CATEGORY_RULES:
+        return False, "הקטגוריה כבר קיימת"
+    CATEGORY_RULES[name] = []
+    if name not in CUSTOM_CATEGORIES:
+        CUSTOM_CATEGORIES.append(name)
+    return True, None
+
+
+def list_all_with_contents() -> list[tuple[str, list[str], list[str], bool]]:
+    """Return [(category, static_keywords, learned_merchants, is_custom)]
+    for every known category, sorted with custom categories last so they
+    stand out."""
+    rows: list[tuple[str, list[str], list[str], bool]] = []
+    for cat in CATEGORY_RULES:
+        keywords = list(CATEGORY_RULES.get(cat, []))
+        merchants = sorted([d for d, c in LEARNED.items() if c == cat])
+        is_custom = cat in CUSTOM_CATEGORIES
+        rows.append((cat, keywords, merchants, is_custom))
+    # Static categories first (in declaration order), then custom ones.
+    rows.sort(key=lambda r: (r[3], 0))
+    return rows
 
 
 def learn(description: str, category: str) -> bool:
@@ -137,7 +201,7 @@ def persist(commit_message: str) -> tuple[bool, str | None]:
     every single category change."""
     try:
         import learning_store
-        return learning_store.save(LEARNED, commit_message)
+        return learning_store.save(_build_save_dict(), commit_message)
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"persist failed: {e}")

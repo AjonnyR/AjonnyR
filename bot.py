@@ -11,6 +11,9 @@ from file_processor import process_pdf, process_excel
 from analyzer import analyze_full, test_gemini
 from categories import (
     CATEGORY_RULES,
+    CUSTOM_CATEGORIES,
+    create_category,
+    list_all_with_contents,
     override as override_category,
     persist as persist_categories,
     persistence_enabled,
@@ -67,6 +70,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
         "/analyze — הרץ ניתוח על מה שכבר שלחת\n"
         "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n"
+        "/newcategory `<שם>` — צור קטגוריה חדשה\n"
+        "/categories — הצג את כל הקטגוריות ומה מתויג בכל אחת\n"
         "/flush — סנכרן עכשיו ל-GitHub שינויים שמחכים בתור\n"
         "/api — בדוק שמפתח Gemini עובד\n"
         "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n\n"
@@ -170,6 +175,73 @@ async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"פעילות כדי לא להפיל את הבוט בכל תיקון. לשמירה מיידית: /flush._",
         parse_mode="Markdown",
     )
+
+
+async def new_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/newcategory <name>  —  add a user-defined category."""
+    raw = (update.message.text or "").split(None, 1)
+    name = raw[1].strip() if len(raw) == 2 else ""
+    if not name:
+        await update.message.reply_text(
+            "שימוש: /newcategory <שם הקטגוריה>\n\n"
+            "לדוגמה: `/newcategory מילואים`",
+            parse_mode="Markdown",
+        )
+        return
+    ok, err = create_category(name)
+    if not ok:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    await schedule_persist(f"New category: {name}")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    await update.message.reply_text(
+        f"✅ נוצרה קטגוריה: *{name}*\n"
+        f"_מעכשיו תופיע בכפתורים וב-/correct. סנכרון ל-GitHub כעבור "
+        f"{minutes} דק' של שקט (או /flush)._",
+        parse_mode="Markdown",
+    )
+
+
+async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/categories  —  list every category and what's in it."""
+    rows = list_all_with_contents()
+    if not rows:
+        await update.message.reply_text("אין קטגוריות מוגדרות.")
+        return
+
+    # Build sections; flush when approaching Telegram's 4096-char limit.
+    MAX_LEN = 3800
+    chunks: list[str] = []
+    current = "📂 *קטגוריות וקטלוגים*\n\n"
+    for cat, keywords, merchants, is_custom in rows:
+        header = f"*{cat}*" + (" 🆕" if is_custom else "")
+        block = f"{header}\n"
+        if keywords:
+            block += f"   🔑 _{len(keywords)} מילות מפתח (בקוד)_\n"
+        if merchants:
+            shown = merchants[:15]
+            for m in shown:
+                block += f"   • {m}\n"
+            if len(merchants) > 15:
+                block += f"   • _ועוד {len(merchants) - 15} עסקאות..._\n"
+        elif not keywords:
+            block += "   _(ריקה)_\n"
+        block += "\n"
+
+        if len(current) + len(block) > MAX_LEN:
+            chunks.append(current)
+            current = ""
+        current += block
+
+    if current:
+        chunks.append(current)
+
+    chunks[-1] += (
+        "_🆕 = נוצרה על ידך. ליצירת קטגוריה חדשה: /newcategory <שם>_\n"
+        "_לתיוג מסחר לקטגוריה: /correct <תיאור> = <קטגוריה>_"
+    )
+    for chunk in chunks:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 async def flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,6 +542,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("correct", correct))
+    app.add_handler(CommandHandler("newcategory", new_category))
+    app.add_handler(CommandHandler("categories", list_categories))
     app.add_handler(CommandHandler("flush", flush))
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(CommandHandler("github", github_diagnose))
