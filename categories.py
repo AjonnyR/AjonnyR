@@ -10,6 +10,8 @@ Order matters: the FIRST category whose keyword appears in the description
 wins. Put more specific categories above more generic ones.
 """
 
+import os
+
 CATEGORY_RULES: dict[str, list[str]] = {
     "דיור ושכירות": [
         "שכר דירה", "ארנונה", "ועד בית", "חברת חשמל", "מי אביבים",
@@ -129,12 +131,10 @@ def override(description: str, category: str) -> bool:
 
 
 def persist(commit_message: str) -> tuple[bool, str | None]:
-    """Try to commit the current LEARNED dict to GitHub.
-
-    Returns (True, None) on success, (False, reason) otherwise where
-    reason is a human-readable Hebrew string suitable for showing the
-    user.
-    """
+    """Immediate (non-debounced) commit. Reserved for /flush and shutdown
+    — application code should call schedule_persist() instead so commits
+    are batched and the user isn't subjected to a Render redeploy on
+    every single category change."""
     try:
         import learning_store
         return learning_store.save(LEARNED, commit_message)
@@ -154,3 +154,102 @@ def persistence_enabled() -> bool:
 
 def get_learned() -> dict[str, str]:
     return dict(LEARNED)
+
+
+# ---------------------------------------------------------------------------
+# Debounced GitHub commit
+# ---------------------------------------------------------------------------
+# Committing to GitHub triggers a Render redeploy (~2-3 min of downtime).
+# Batch changes so a burst of /correct + button taps produces ONE commit
+# instead of one per change. The flush fires PERSIST_DEBOUNCE_SECONDS
+# after the last activity that touched the timer.
+
+import asyncio as _asyncio
+
+PERSIST_DEBOUNCE_SECONDS = int(os.environ.get("PERSIST_DEBOUNCE_SECONDS", "600"))
+
+_pending_messages: list[str] = []
+_pending_task: "_asyncio.Task | None" = None
+
+
+def has_pending() -> bool:
+    return len(_pending_messages) > 0
+
+
+def pending_count() -> int:
+    return len(_pending_messages)
+
+
+async def schedule_persist(commit_message: str) -> None:
+    """Queue a change for later commit. The actual GitHub PUT happens
+    PERSIST_DEBOUNCE_SECONDS after the last call to schedule_persist or
+    reset_flush_timer — so several rapid changes coalesce into one
+    commit and one Render redeploy."""
+    _pending_messages.append(commit_message)
+    _reschedule()
+
+
+async def reset_flush_timer() -> None:
+    """Push the flush further out without adding a new change. Called
+    from every user-facing handler so the rule becomes 'flush 10 min
+    after the last user interaction' rather than 'after the last
+    change'."""
+    if _pending_messages:
+        _reschedule()
+
+
+def _reschedule() -> None:
+    global _pending_task
+    if _pending_task and not _pending_task.done():
+        _pending_task.cancel()
+    try:
+        _pending_task = _asyncio.create_task(_flush_after_delay())
+    except RuntimeError:
+        # No running event loop (e.g. called from a sync test) — give up
+        # silently; the next async call site will reschedule.
+        _pending_task = None
+
+
+async def _flush_after_delay() -> None:
+    try:
+        await _asyncio.sleep(PERSIST_DEBOUNCE_SECONDS)
+    except _asyncio.CancelledError:
+        return
+    await _do_flush()
+
+
+async def _do_flush() -> tuple[bool, str | None]:
+    """Drain pending_messages and commit. Safe to call from outside the
+    debounce path (e.g. /flush command)."""
+    global _pending_messages, _pending_task
+    if not _pending_messages:
+        return True, None
+    n = len(_pending_messages)
+    first = _pending_messages[0]
+    if n == 1:
+        msg = first
+    else:
+        msg = f"Batch: {n} changes ({first}, +{n - 1} more)"
+    msgs_being_flushed = list(_pending_messages)
+    _pending_messages = []
+    _pending_task = None
+    loop = _asyncio.get_event_loop()
+    try:
+        ok, err = await loop.run_in_executor(None, persist, msg)
+    except Exception as e:
+        ok, err = False, str(e)
+    if not ok:
+        # Restore so a later flush can retry.
+        _pending_messages[:0] = msgs_being_flushed
+        import logging
+        logging.getLogger(__name__).warning(f"Batched persist failed: {err}")
+    return ok, err
+
+
+async def flush_now() -> tuple[bool, str | None]:
+    """User-triggered immediate flush (/flush command)."""
+    global _pending_task
+    if _pending_task and not _pending_task.done():
+        _pending_task.cancel()
+        _pending_task = None
+    return await _do_flush()

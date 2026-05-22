@@ -7,7 +7,9 @@ import urllib.error
 import time
 from datetime import datetime
 
-from categories import categorize, learn, persist, get_learned, CATEGORY_RULES
+from categories import (
+    categorize, learn, persist, schedule_persist, get_learned, CATEGORY_RULES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +99,16 @@ async def analyze_full(
             ai_error = e
             logger.error(f"Gemini analysis failed: {e}")
 
-    # Persist newly-learned categories to GitHub if configured (a single
-    # commit per upload). Off-thread so we don't block the response.
+    # Queue newly-learned categories for batched commit. The actual
+    # GitHub PUT (and the resulting Render redeploy) happens once after
+    # PERSIST_DEBOUNCE_SECONDS of user inactivity, so a session with
+    # multiple uploads + corrections produces a single redeploy.
     if newly_learned:
         msg = f"Learn {len(newly_learned)} new {'category' if len(newly_learned) == 1 else 'categories'} from AI"
         try:
-            loop = asyncio.get_event_loop()
-            ok, err = await loop.run_in_executor(None, persist, msg)
-            if not ok and err:
-                logger.warning(f"persist after analyze failed: {err}")
+            await schedule_persist(msg)
         except Exception as e:
-            logger.warning(f"persist after analyze failed: {e}")
+            logger.warning(f"schedule_persist after analyze failed: {e}")
 
     # Build per-transaction category and collect descriptions that landed
     # in "אחר" (the user might want to fix them inline via buttons).

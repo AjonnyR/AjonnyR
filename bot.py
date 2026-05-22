@@ -5,7 +5,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes,
+    TypeHandler, filters, ContextTypes,
 )
 from file_processor import process_pdf, process_excel
 from analyzer import analyze_full, test_gemini
@@ -14,6 +14,12 @@ from categories import (
     override as override_category,
     persist as persist_categories,
     persistence_enabled,
+    schedule_persist,
+    reset_flush_timer,
+    flush_now,
+    has_pending,
+    pending_count,
+    PERSIST_DEBOUNCE_SECONDS,
 )
 
 # Max uncategorised merchants to expose as button messages per upload.
@@ -28,6 +34,16 @@ TMP = tempfile.gettempdir()
 
 # זוכר את הקבצים של כל משתמש עד שהוא שולח את שניהם
 user_files = {}
+
+async def _touch_idle_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group -1 middleware: bumps the debounce timer on any user activity
+    so 'flush 10 min after last interaction' holds. Never consumes the
+    update — control falls through to the real handler."""
+    try:
+        await reset_flush_timer()
+    except Exception as e:
+        logger.debug(f"reset_flush_timer ignored: {e}")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -50,9 +66,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — הסבר התחלתי\n"
         "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
         "/analyze — הרץ ניתוח על מה שכבר שלחת\n"
+        "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n"
+        "/flush — סנכרן עכשיו ל-GitHub שינויים שמחכים בתור\n"
         "/api — בדוק שמפתח Gemini עובד\n"
-        "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n"
-        "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n\n"
+        "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n\n"
         "*שימוש רגיל:* שלח לי שלושה קבצים:\n"
         "1️⃣ PDF של עו\"ש פועלים\n"
         "2️⃣ Excel של כאל פועלים\n"
@@ -145,21 +162,33 @@ async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(f"✏️ עודכן בזיכרון: *{desc}* → *{cat}*\nשומר...", parse_mode="Markdown")
-
-    loop = asyncio.get_event_loop()
-    ok, err = await loop.run_in_executor(
-        None, persist_categories, f"User correction: {desc} → {cat}"
+    await schedule_persist(f"User correction: {desc} → {cat}")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    await update.message.reply_text(
+        f"✅ *{desc}* → *{cat}*\n"
+        f"_נשמר בזיכרון. שמירה ל-GitHub תתבצע כעבור {minutes} דק' של חוסר "
+        f"פעילות כדי לא להפיל את הבוט בכל תיקון. לשמירה מיידית: /flush._",
+        parse_mode="Markdown",
     )
+
+
+async def flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force an immediate GitHub commit of any queued category changes.
+    Useful when the user knows they're done and doesn't want to wait the
+    debounce window."""
+    n = pending_count()
+    if n == 0:
+        await update.message.reply_text("ℹ️ אין שינויים בתור — אין מה לסנכרן.")
+        return
+    await update.message.reply_text(f"💾 מסנכרן {n} שינויים ל-GitHub...")
+    ok, err = await flush_now()
     if ok:
         await update.message.reply_text(
-            "✅ נשמר בריפו. Render יעלה גרסה חדשה בעוד 2-3 דקות "
-            "ואז התיקון יישאר לתמיד."
+            "✅ נשמר. Render יעלה גרסה חדשה בעוד 2-3 דקות."
         )
     else:
         await update.message.reply_text(
-            f"⚠️ התיקון בזיכרון אבל לא נשמר לעולם:\n\n{err}\n\n"
-            f"לאבחון מלא שלח /github",
+            f"⚠️ השמירה נכשלה: {err}\nהשינויים נשארים בזיכרון לניסיון נוסף."
         )
 
 
@@ -410,19 +439,12 @@ async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cat = categories[cat_idx]
     override_category(desc, cat)
-
-    # Persist to GitHub off-thread.
-    loop = asyncio.get_event_loop()
-    ok, err = await loop.run_in_executor(
-        None, persist_categories, f"User correction (button): {desc} → {cat}"
+    await schedule_persist(f"User correction (button): {desc} → {cat}")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    text = (
+        f"✅ *{desc}* → *{cat}*\n"
+        f"_נשמר. סנכרון ל-GitHub בעוד {minutes} דק' של שקט (או /flush)._"
     )
-
-    if ok:
-        text = f"✅ *{desc}* → *{cat}* (נשמר בריפו)"
-    elif err and "כבויה" in err:
-        text = f"✅ *{desc}* → *{cat}* (בזיכרון בלבד — GitHub לא מוגדר)"
-    else:
-        text = f"⚠️ *{desc}* → *{cat}* (בזיכרון; שמירה נכשלה: {err})"
     await query.edit_message_text(text, parse_mode="Markdown")
 
 def main():
@@ -440,10 +462,15 @@ def main():
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(token).build()
+    # Group -1: runs before every other handler. Resets the debounced
+    # commit timer so "10 min of inactivity" measures from the user's
+    # last interaction, not just from the last category change.
+    app.add_handler(TypeHandler(Update, _touch_idle_timer), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("correct", correct))
+    app.add_handler(CommandHandler("flush", flush))
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(CommandHandler("github", github_diagnose))
     app.add_handler(CommandHandler("analyze", analyze_now))
