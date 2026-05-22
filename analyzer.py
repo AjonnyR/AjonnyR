@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 
 from categories import (
-    categorize, learn, persist, schedule_persist, get_learned, CATEGORY_RULES,
+    categorize, learn, persist, schedule_persist, get_learned,
+    CATEGORY_RULES, LEARNED,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,17 @@ async def analyze_full(
     # Ask AI to categorise unique descriptions and produce tips in one call.
     # If AI fails, categorisation falls back to categorize() (which already
     # consults LEARNED from any prior successful AI call this container).
+    # IMPORTANT: only send merchants that don't already have a category
+    # (not in LEARNED and no static rule matches). This:
+    #   1. Protects prior decisions — user /correct + button taps + earlier
+    #      AI labels are never overwritten by a fresh AI call.
+    #   2. Saves Gemini tokens — already-known merchants don't go on the wire.
     unique_descs = list(by_desc.keys())
+    descs_for_ai = [
+        d for d in unique_descs
+        if d not in LEARNED and categorize(d) == "אחר"
+    ]
+
     api_key = os.environ.get("GEMINI_API_KEY")
     ai_categories: dict[str, str] = {}
     ai_tips: list[str] = []
@@ -90,9 +101,15 @@ async def analyze_full(
     if api_key:
         try:
             ai_categories, ai_tips = await _get_ai_analysis(
-                api_key, unique_descs, total_income, total_expense, net_flow,
+                api_key, descs_for_ai, total_income, total_expense, net_flow,
             )
             for desc, cat in ai_categories.items():
+                # Defence in depth — never overwrite an existing category
+                # even if the AI returned one for a merchant we didn't ask about.
+                if desc in LEARNED:
+                    continue
+                if categorize(desc) != "אחר":
+                    continue
                 if learn(desc, cat):
                     newly_learned[desc] = cat
         except Exception as e:
@@ -157,14 +174,28 @@ async def _get_ai_analysis(
     total_expense: float,
     net_flow: float,
 ) -> tuple[dict[str, str], list[str]]:
-    """Ask Gemini to categorise every unique description AND produce tips
+    """Ask Gemini to categorise the supplied descriptions AND produce tips
     in one call. Returns (description_to_category, tips).
 
-    Prompt size scales with the number of unique merchants (~30 chars
-    each), not with the number of transactions. Typical: 300-500 tokens
-    input, 200-400 tokens output."""
+    `descriptions` should already be filtered to merchants that need a
+    category — known merchants are excluded by the caller so the AI
+    doesn't waste tokens (or risk overwriting prior decisions).
+
+    Prompt size scales with the number of unique uncategorised merchants
+    (~30 chars each), not with the number of transactions."""
     cat_list = ", ".join(CATEGORY_RULES.keys())
-    desc_lines = "\n".join(f"- {d}" for d in descriptions)
+
+    if descriptions:
+        desc_section = (
+            f"Categorise each of these NEW merchant/transaction descriptions "
+            f"into exactly one of: {cat_list}\n\n"
+            f"Descriptions:\n" + "\n".join(f"- {d}" for d in descriptions) + "\n\n"
+        )
+        categories_json_hint = '"categories": {"<description>": "<category>", ...}, '
+    else:
+        # All merchants already have categories — no labelling work, just tips.
+        desc_section = "All merchants in this statement are already categorised.\n\n"
+        categories_json_hint = '"categories": {}, '
 
     prompt = (
         f"You are a personal finance assistant for an Israeli user. Reply in Hebrew.\n\n"
@@ -172,12 +203,10 @@ async def _get_ai_analysis(
         f"- Income: {total_income:,.0f}\n"
         f"- Expenses: {total_expense:,.0f}\n"
         f"- Net: {net_flow:+,.0f}\n\n"
-        f"Categorise each of these merchant/transaction descriptions into "
-        f"exactly one of: {cat_list}\n\n"
-        f"Descriptions:\n{desc_lines}\n\n"
-        f"Then give 3-5 specific, actionable Hebrew tips based on the data.\n\n"
+        f"{desc_section}"
+        f"Give 3-5 specific, actionable Hebrew tips based on the data.\n\n"
         f'Reply with ONLY this JSON, no markdown, no backticks:\n'
-        f'{{"categories": {{"<description>": "<category>", ...}}, '
+        f'{{{categories_json_hint}'
         f'"tips": ["tip 1", "tip 2", "tip 3"]}}'
     )
 
