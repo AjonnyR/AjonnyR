@@ -55,8 +55,15 @@ LEARNED: dict[str, str] = {}
 # `__categories__` so creating a category doesn't cost a second commit.
 CUSTOM_CATEGORIES: list[str] = []
 
-# Reserved key inside learned.json — must not collide with merchant names.
+# Per-merchant totals from the most recent /analyze run. Used by
+# /categories to show "how much" per merchant and by the button-tap /
+# /correct confirmations to say "N transactions moved". Replaced
+# wholesale on each analyze — reflects the last upload's data.
+MERCHANT_SNAPSHOT: dict[str, dict] = {}
+
+# Reserved keys inside learned.json — must not collide with merchant names.
 _CATEGORIES_KEY = "__categories__"
+_SNAPSHOT_KEY = "__merchant_snapshot__"
 
 
 def _load_from_store() -> None:
@@ -67,6 +74,7 @@ def _load_from_store() -> None:
         if not loaded:
             return
         # Split: list under __categories__ = user-created category names;
+        # dict under __merchant_snapshot__ = per-merchant {count, total};
         # string values = merchant → category mappings.
         custom = loaded.get(_CATEGORIES_KEY, [])
         if isinstance(custom, list):
@@ -74,8 +82,20 @@ def _load_from_store() -> None:
                 if isinstance(name, str) and name and name not in CATEGORY_RULES:
                     CATEGORY_RULES[name] = []
                     CUSTOM_CATEGORIES.append(name)
+        snapshot = loaded.get(_SNAPSHOT_KEY, {})
+        if isinstance(snapshot, dict):
+            for k, v in snapshot.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    MERCHANT_SNAPSHOT[str(k)] = {
+                        "count": int(v.get("count", 0)),
+                        "total": float(v.get("total", 0.0)),
+                    }
+                except (TypeError, ValueError):
+                    continue
         for k, v in loaded.items():
-            if k == _CATEGORIES_KEY:
+            if k in (_CATEGORIES_KEY, _SNAPSHOT_KEY):
                 continue
             if isinstance(v, str):
                 LEARNED[str(k)] = v
@@ -89,11 +109,36 @@ _load_from_store()
 
 def _build_save_dict() -> dict:
     """Construct the dict that goes into learned.json: all learned
-    mappings PLUS the custom-categories list under the reserved key."""
+    mappings PLUS the custom-categories list and the merchant-snapshot
+    under reserved keys."""
     out: dict = dict(LEARNED)
     if CUSTOM_CATEGORIES:
         out[_CATEGORIES_KEY] = sorted(set(CUSTOM_CATEGORIES))
+    if MERCHANT_SNAPSHOT:
+        out[_SNAPSHOT_KEY] = MERCHANT_SNAPSHOT
     return out
+
+
+def update_merchant_snapshot(transactions: list[dict]) -> None:
+    """Recompute per-merchant {count, total} from the latest analysis.
+    Replaces any previous snapshot — represents the most recent upload
+    only (matches the user's monthly review workflow)."""
+    MERCHANT_SNAPSHOT.clear()
+    for t in transactions:
+        desc = t.get("description")
+        if not desc:
+            continue
+        amount = float(t.get("amount", 0.0))
+        info = MERCHANT_SNAPSHOT.setdefault(str(desc), {"count": 0, "total": 0.0})
+        info["count"] += 1
+        info["total"] += amount
+
+
+def get_merchant_info(desc: str) -> tuple[int, float]:
+    """Return (count, total) for a description from the latest snapshot,
+    or (0, 0.0) if the merchant wasn't in the most recent analysis."""
+    info = MERCHANT_SNAPSHOT.get(desc, {})
+    return int(info.get("count", 0)), float(info.get("total", 0.0))
 
 
 def create_category(name: str) -> tuple[bool, str | None]:
@@ -202,17 +247,25 @@ def delete_category(name: str, move_to: str = "אחר") -> tuple[bool, str | Non
     return True, None, moved
 
 
-def list_all_with_contents() -> list[tuple[str, list[str], list[str], bool]]:
-    """Return [(category, static_keywords, learned_merchants, is_custom)]
-    for every known category, sorted with custom categories last so they
-    stand out."""
-    rows: list[tuple[str, list[str], list[str], bool]] = []
+def list_all_with_contents() -> list[tuple[str, list[str], list[tuple[str, int, float]], bool]]:
+    """Return [(category, static_keywords, merchants, is_custom)] for every
+    known category. Each `merchants` entry is (name, count, total) where
+    count/total come from the latest analysis snapshot (0/0.0 for merchants
+    learned previously but not in the most recent upload). Merchants are
+    sorted by total descending. Custom categories appear last."""
+    rows: list[tuple[str, list[str], list[tuple[str, int, float]], bool]] = []
     for cat in CATEGORY_RULES:
         keywords = list(CATEGORY_RULES.get(cat, []))
-        merchants = sorted([d for d, c in LEARNED.items() if c == cat])
+        names = [d for d, c in LEARNED.items() if c == cat]
+        merchants: list[tuple[str, int, float]] = []
+        for name in names:
+            count, total = get_merchant_info(name)
+            merchants.append((name, count, total))
+        # Biggest spend first; merchants without snapshot data (count == 0)
+        # fall to the bottom, alphabetised among themselves.
+        merchants.sort(key=lambda m: (-m[2], m[0]))
         is_custom = cat in CUSTOM_CATEGORIES
         rows.append((cat, keywords, merchants, is_custom))
-    # Static categories first (in declaration order), then custom ones.
     rows.sort(key=lambda r: (r[3], 0))
     return rows
 

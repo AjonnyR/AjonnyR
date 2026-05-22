@@ -9,6 +9,7 @@ from datetime import datetime
 
 from categories import (
     categorize, learn, persist, schedule_persist, get_learned,
+    update_merchant_snapshot,
     CATEGORY_RULES, LEARNED,
 )
 
@@ -64,6 +65,12 @@ async def analyze_full(
     total_income = sum(t["amount"] for t in incomes)
     net_flow = total_income - total_expense
 
+    # Refresh the per-merchant snapshot so /categories and the button
+    # confirmations can show how many transactions / how much per
+    # merchant. Replaces any previous snapshot (matches the user's
+    # monthly review pattern).
+    update_merchant_snapshot(expenses)
+
     poalim_count = sum(1 for t in expenses if "פועלים" in t["source"] and t["source"] != "כאל פועלים")
     max_count = sum(1 for t in expenses if t["source"] == "מקס")
     cal_count = sum(1 for t in expenses if t["source"] == "כאל פועלים")
@@ -116,16 +123,21 @@ async def analyze_full(
             ai_error = e
             logger.error(f"Gemini analysis failed: {e}")
 
-    # Queue newly-learned categories for batched commit. The actual
-    # GitHub PUT (and the resulting Render redeploy) happens once after
-    # PERSIST_DEBOUNCE_SECONDS of user inactivity, so a session with
-    # multiple uploads + corrections produces a single redeploy.
+    # Queue persist for the merchant snapshot (always changes on analyze)
+    # and any newly-learned categories. The debounce coalesces multiple
+    # analyses in a session into a single GitHub commit / Render redeploy.
     if newly_learned:
-        msg = f"Learn {len(newly_learned)} new {'category' if len(newly_learned) == 1 else 'categories'} from AI"
-        try:
-            await schedule_persist(msg)
-        except Exception as e:
-            logger.warning(f"schedule_persist after analyze failed: {e}")
+        msg = (
+            f"Learn {len(newly_learned)} new "
+            f"{'category' if len(newly_learned) == 1 else 'categories'} "
+            f"from AI + refresh merchant snapshot"
+        )
+    else:
+        msg = "Refresh merchant snapshot"
+    try:
+        await schedule_persist(msg)
+    except Exception as e:
+        logger.warning(f"schedule_persist after analyze failed: {e}")
 
     # Build per-transaction category and collect descriptions that landed
     # in "אחר" (the user might want to fix them inline via buttons).

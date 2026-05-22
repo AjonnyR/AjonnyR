@@ -18,6 +18,7 @@ from categories import (
     rename_category,
     delete_category,
     list_all_with_contents,
+    get_merchant_info,
     override as override_category,
     persist as persist_categories,
     persistence_enabled,
@@ -175,10 +176,12 @@ async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await schedule_persist(f"User correction: {desc} → {cat}")
     minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    count, total = get_merchant_info(desc)
+    qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
     await update.message.reply_text(
-        f"✅ *{desc}* → *{cat}*\n"
-        f"_נשמר בזיכרון. שמירה ל-GitHub תתבצע כעבור {minutes} דק' של חוסר "
-        f"פעילות כדי לא להפיל את הבוט בכל תיקון. לשמירה מיידית: /flush._",
+        f"✅ *{desc}*{qty} → *{cat}*\n"
+        f"_כל העסקאות בשם הזה הועברו לקטגוריה החדשה. "
+        f"שמירה ל-GitHub כעבור {minutes} דק' של שקט (או /flush)._",
         parse_mode="Markdown",
     )
 
@@ -291,13 +294,23 @@ async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chunks: list[str] = []
     current = "📂 <b>קטגוריות</b>\n\n"
     for cat, keywords, merchants, is_custom in rows:
+        cat_total = sum(m[2] for m in merchants if m[1] > 0)
+        cat_count = sum(m[1] for m in merchants if m[1] > 0)
         header = f"<b>{esc(cat)}</b>" + (" 🆕" if is_custom else "")
+        if cat_total > 0:
+            header += f" — {cat_total:,.0f} ₪ ({cat_count} עסקאות)"
         block = f"{header}\n"
         if keywords:
             block += f"   🔑 <i>{len(keywords)} מילות מפתח (בקוד)</i>\n"
         if merchants:
-            for m in merchants[:15]:
-                block += f"   • {esc(m)}\n"
+            for m_name, m_count, m_total in merchants[:15]:
+                if m_count > 0:
+                    block += (
+                        f"   • {esc(m_name)}: {m_total:,.0f} ₪ "
+                        f"({m_count} פעמים)\n"
+                    )
+                else:
+                    block += f"   • {esc(m_name)} <i>(לא בחודש האחרון)</i>\n"
             if len(merchants) > 15:
                 block += f"   • <i>ועוד {len(merchants) - 15} עסקאות...</i>\n"
         elif not keywords:
@@ -593,9 +606,11 @@ async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     override_category(desc, cat)
     await schedule_persist(f"User correction (button): {desc} → {cat}")
     minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    count, total = get_merchant_info(desc)
+    qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
     text = (
-        f"✅ *{desc}* → *{cat}*\n"
-        f"_נשמר. סנכרון ל-GitHub בעוד {minutes} דק' של שקט (או /flush)._"
+        f"✅ *{desc}*{qty} → *{cat}*\n"
+        f"_כל העסקאות בשם הזה הועברו. סנכרון ל-GitHub בעוד {minutes} דק' של שקט._"
     )
     await query.edit_message_text(text, parse_mode="Markdown")
 
