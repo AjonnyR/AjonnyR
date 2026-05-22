@@ -12,13 +12,21 @@ logger = logging.getLogger(__name__)
 
 CATEGORIES = list(CATEGORY_RULES.keys())
 
-async def analyze_expenses(transactions: list[dict], closing_balance: float | None = None) -> str:
+async def analyze_full(
+    transactions: list[dict], closing_balance: float | None = None
+) -> tuple[str, list[tuple[str, float]]]:
     """Produce the full report.
 
-    Categorisation, merchant aggregation, balance and net-flow are all done
-    LOCALLY. Gemini is asked only for personalised tips (a tiny prompt) —
-    if it fails, we fall back to local rule-based tips. This keeps API
-    usage minimal and the report still works even when AI is unavailable.
+    Categorisation comes from AI (primary) with a fallback to the
+    categorize() chain (LEARNED → static rules → "אחר"). Everything else
+    — balance, totals, net flow, merchant aggregation — is computed
+    locally.
+
+    Returns (report_text, uncategorized_descriptions) where
+    uncategorized_descriptions is a list of (description, total) tuples
+    for merchants that ended up in "אחר", sorted by total descending.
+    The caller can use this list to offer the user inline buttons to fix
+    them.
     """
     # Poalim is the main account. The monthly "Max" debit line in Poalim
     # is just a summary of the per-merchant rows in the Max file — if we
@@ -92,27 +100,44 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
         except Exception as e:
             logger.warning(f"persist after analyze failed: {e}")
 
-    # Build per-transaction category using AI's answer first, then the
-    # categorize() chain (LEARNED → static rules → "אחר").
+    # Build per-transaction category and collect descriptions that landed
+    # in "אחר" (the user might want to fix them inline via buttons).
     cat_totals: dict[str, float] = {}
+    uncategorized_totals: dict[str, float] = {}
     for t in expenses:
         cat = ai_categories.get(t["description"]) or categorize(t["description"])
         if cat not in CATEGORY_RULES:
             cat = "אחר"
         cat_totals[cat] = cat_totals.get(cat, 0.0) + t["amount"]
+        if cat == "אחר":
+            uncategorized_totals[t["description"]] = (
+                uncategorized_totals.get(t["description"], 0.0) + t["amount"]
+            )
 
     # Tips: use AI's if delivered, otherwise local rule-based.
     tips = ai_tips if ai_tips else _local_tips(
         expenses, total_expense, total_income, net_flow, cat_totals
     )
 
-    return _format_report(
+    report = _format_report(
         cat_totals, top_merchants, tips, newly_learned,
         expenses, incomes, max_summary_skipped,
         total_expense, total_income, net_flow,
         poalim_count, max_count, closing_balance,
         ai_error if not ai_categories else None,
     )
+
+    # Sort uncategorized by total descending — biggest first matters most.
+    uncategorized_sorted = sorted(
+        uncategorized_totals.items(), key=lambda x: x[1], reverse=True
+    )
+    return report, uncategorized_sorted
+
+
+async def analyze_expenses(transactions: list[dict], closing_balance: float | None = None) -> str:
+    """Backwards-compatible wrapper that returns only the report string."""
+    report, _ = await analyze_full(transactions, closing_balance)
+    return report
 
 
 async def _get_ai_analysis(

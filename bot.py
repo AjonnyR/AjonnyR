@@ -2,16 +2,24 @@ import os
 import asyncio
 import tempfile
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes,
+)
 from file_processor import process_pdf, process_excel
-from analyzer import analyze_expenses, test_gemini
+from analyzer import analyze_full, test_gemini
 from categories import (
     CATEGORY_RULES,
     override as override_category,
     persist as persist_categories,
     persistence_enabled,
 )
+
+# Max uncategorised merchants to expose as button messages per upload.
+MAX_BUTTON_PROMPTS = 5
+# How many categories per inline-keyboard row.
+KEYBOARD_COLS = 2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -185,17 +193,103 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_transactions = user_files[user_id]["poalim"] + user_files[user_id]["max"]
 
         try:
-            report = await analyze_expenses(
+            report, uncategorized = await analyze_full(
                 all_transactions,
                 closing_balance=user_files[user_id].get("closing_balance"),
             )
             await update.message.reply_text(report, parse_mode="Markdown")
+            if uncategorized:
+                await _send_category_prompts(update, context, uncategorized)
         except Exception as e:
             logger.error(f"Error analyzing: {e}")
             await update.message.reply_text("❌ אירעה שגיאה בניתוח. נסה שנית או פנה לתמיכה.")
 
         # מנקים אחרי שליחה
         del user_files[user_id]
+
+
+def _category_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Build an inline keyboard with one button per category.
+
+    token: a short numeric id encoded in callback_data to identify which
+    merchant the user is categorising. The full description is kept in
+    context.user_data so we don't blow the 64-byte callback_data limit.
+    """
+    categories = list(CATEGORY_RULES.keys())
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(categories), KEYBOARD_COLS):
+        rows.append([
+            InlineKeyboardButton(cat, callback_data=f"setcat:{token}:{idx}")
+            for idx, cat in enumerate(categories[i:i + KEYBOARD_COLS], start=i)
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_category_prompts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    uncategorized: list[tuple[str, float]],
+) -> None:
+    """Send one button-message per uncategorised merchant (capped)."""
+    pending = context.user_data.setdefault("pending_categories", {})
+    shown = uncategorized[:MAX_BUTTON_PROMPTS]
+    if len(uncategorized) > MAX_BUTTON_PROMPTS:
+        await update.message.reply_text(
+            f"🔍 {len(uncategorized)} בתי עסק לא קוטלגו. "
+            f"מציג כפתורים ל-{MAX_BUTTON_PROMPTS} הגדולים; "
+            f"לשאר שלח /correct."
+        )
+    for desc, amount in shown:
+        # Use the next available short numeric token.
+        token = str(len(pending))
+        pending[token] = desc
+        await update.message.reply_text(
+            f"🔍 *{desc}*  ({amount:,.0f} ₪)\nבחר קטגוריה:",
+            reply_markup=_category_keyboard(token),
+            parse_mode="Markdown",
+        )
+
+
+async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler for the inline-keyboard taps."""
+    query = update.callback_query
+    await query.answer()
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "setcat":
+        return
+
+    token, cat_idx_str = parts[1], parts[2]
+    try:
+        cat_idx = int(cat_idx_str)
+    except ValueError:
+        return
+
+    pending = context.user_data.get("pending_categories") or {}
+    desc = pending.get(token)
+    categories = list(CATEGORY_RULES.keys())
+    if not desc or cat_idx >= len(categories):
+        await query.edit_message_text("❌ הכפתור פג תוקף. שלח /correct <תיאור> = <קטגוריה>")
+        return
+
+    cat = categories[cat_idx]
+    override_category(desc, cat)
+
+    # Persist to GitHub off-thread.
+    loop = asyncio.get_event_loop()
+    ok, err = await loop.run_in_executor(
+        None, persist_categories, f"User correction (button): {desc} → {cat}"
+    )
+
+    if ok:
+        text = f"✅ *{desc}* → *{cat}* (נשמר בריפו)"
+    elif err and "כבויה" in err:
+        text = f"✅ *{desc}* → *{cat}* (בזיכרון בלבד — GitHub לא מוגדר)"
+    else:
+        text = f"⚠️ *{desc}* → *{cat}* (בזיכרון; שמירה נכשלה: {err})"
+    await query.edit_message_text(text, parse_mode="Markdown")
+
+    # Drop the token so it can't be reused.
+    pending.pop(token, None)
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -218,6 +312,7 @@ def main():
     app.add_handler(CommandHandler("correct", correct))
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(CommandHandler("github", github_diagnose))
+    app.add_handler(CallbackQueryHandler(category_button, pattern=r"^setcat:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
