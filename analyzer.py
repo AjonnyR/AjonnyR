@@ -86,7 +86,9 @@ async def analyze_expenses(transactions: list[dict], closing_balance: float | No
         msg = f"Learn {len(newly_learned)} new {'category' if len(newly_learned) == 1 else 'categories'} from AI"
         try:
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, persist, msg)
+            ok, err = await loop.run_in_executor(None, persist, msg)
+            if not ok and err:
+                logger.warning(f"persist after analyze failed: {err}")
         except Exception as e:
             logger.warning(f"persist after analyze failed: {e}")
 

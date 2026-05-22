@@ -38,6 +38,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — הסבר התחלתי\n"
         "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
         "/api — בדוק שמפתח Gemini עובד\n"
+        "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n"
         "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n\n"
         "*שימוש רגיל:* שלח לי PDF של פועלים ו-Excel של מקס. אני אחזיר דוח "
         "עם יתרה, הכנסות, הוצאות, פילוח קטגוריות, ובתי עסק מובילים.",
@@ -84,28 +85,32 @@ async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✏️ עודכן בזיכרון: *{desc}* → *{cat}*\nשומר...", parse_mode="Markdown")
 
-    if persistence_enabled():
-        loop = asyncio.get_event_loop()
-        ok = await loop.run_in_executor(
-            None, persist_categories, f"User correction: {desc} → {cat}"
+    loop = asyncio.get_event_loop()
+    ok, err = await loop.run_in_executor(
+        None, persist_categories, f"User correction: {desc} → {cat}"
+    )
+    if ok:
+        await update.message.reply_text(
+            "✅ נשמר בריפו. Render יעלה גרסה חדשה בעוד 2-3 דקות "
+            "ואז התיקון יישאר לתמיד."
         )
-        if ok:
-            await update.message.reply_text(
-                "✅ נשמר בריפו. Render יעלה גרסה חדשה בעוד 2-3 דקות "
-                "ואז התיקון יישאר לתמיד."
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ נשמר בזיכרון אבל ה-commit ל-GitHub נכשל — בדוק את ה-Logs ב-Render."
-            )
     else:
         await update.message.reply_text(
-            "ℹ️ התיקון בזיכרון בלבד — יעלם בהפעלה הבאה של הבוט.\n"
-            "להגדרת שמירה קבועה: הוסף ב-Render משתני סביבה "
-            "`GITHUB_TOKEN` (PAT עם הרשאת repo) ו-`GITHUB_REPO` "
-            "(`AjonnyR/AjonnyR`).",
-            parse_mode="Markdown",
+            f"⚠️ התיקון בזיכרון אבל לא נשמר לעולם:\n\n{err}\n\n"
+            f"לאבחון מלא שלח /github",
         )
+
+
+async def github_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test GitHub credentials end-to-end and report what's wrong."""
+    await update.message.reply_text("בודק את הגדרות GitHub...")
+    loop = asyncio.get_event_loop()
+    try:
+        import learning_store
+        report = await loop.run_in_executor(None, learning_store.diagnose)
+    except Exception as e:
+        report = f"❌ שגיאה: {e}"
+    await update.message.reply_text(report, parse_mode="Markdown")
 
 
 async def api_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,6 +217,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("correct", correct))
     app.add_handler(CommandHandler("api", api_diagnose))
+    app.add_handler(CommandHandler("github", github_diagnose))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")

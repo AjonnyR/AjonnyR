@@ -128,16 +128,20 @@ def override(description: str, category: str) -> bool:
     return True
 
 
-def persist(commit_message: str) -> bool:
-    """Try to commit the current LEARNED dict to GitHub. Returns True on
-    success, False if persistence is disabled or the commit failed."""
+def persist(commit_message: str) -> tuple[bool, str | None]:
+    """Try to commit the current LEARNED dict to GitHub.
+
+    Returns (True, None) on success, (False, reason) otherwise where
+    reason is a human-readable Hebrew string suitable for showing the
+    user.
+    """
     try:
         import learning_store
         return learning_store.save(LEARNED, commit_message)
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"persist failed: {e}")
-        return False
+        return False, f"שגיאה לא צפויה: {e}"
 
 
 def persistence_enabled() -> bool:
