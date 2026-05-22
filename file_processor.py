@@ -7,15 +7,13 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-def process_pdf(file_path: str) -> tuple[list[dict], float | None]:
-    """Parse a Hapoalim PDF.
+def process_pdf(file_path: str) -> tuple[list[dict], float | None, str]:
+    """Parse a PDF — auto-detects Hapoalim עו"ש vs Cal credit-card statement.
 
-    Returns (transactions, closing_balance). closing_balance is the balance
-    after the most recent dated transaction in the statement — i.e. the
-    user's current account balance — or None if it couldn't be extracted.
+    Returns (transactions, closing_balance, pdf_type) where pdf_type is one
+    of "poalim", "cal", or "unknown". closing_balance is set only for
+    Poalim statements.
     """
-    transactions: list[dict] = []
-    closing_balance: float | None = None
     try:
         with pdfplumber.open(file_path) as pdf:
             full_text = ""
@@ -23,23 +21,126 @@ def process_pdf(file_path: str) -> tuple[list[dict], float | None]:
                 text = page.extract_text()
                 if text:
                     full_text += text + "\n"
-        transactions, closing_balance = _parse_poalim_evosh(full_text)
     except Exception as e:
         logger.error(f"PDF read error: {e}")
-        return [], None
+        return [], None, "unknown"
+
+    # Cal statement contains the Hebrew "חיובים קודמים" (reversed in text).
+    if "םימדוק םיבויח" in full_text:
+        transactions = _parse_cal_pdf(full_text)
+        logger.info(f"כאל: נמצאו {len(transactions)} עסקאות")
+        return transactions, None, "cal"
+
+    # Default to Hapoalim עו"ש — recognised by the "##" row markers.
+    transactions, closing_balance = _parse_poalim_evosh(full_text)
     logger.info(f"פועלים: נמצאו {len(transactions)} עסקאות, יתרה={closing_balance}")
-    return transactions, closing_balance
+    return transactions, closing_balance, "poalim"
+
+
+def _normalise_cal_date(date: str) -> str:
+    """Convert DD/MM/YY → DD/MM/20YY for consistency with Hapoalim PDF."""
+    parts = date.split("/")
+    if len(parts) == 3 and len(parts[2]) == 2:
+        return f"{parts[0]}/{parts[1]}/20{parts[2]}"
+    return date
+
+
+def _parse_cal_pdf(text: str) -> list[dict]:
+    """Parse a Cal (Hapoalim credit-card) PDF.
+
+    The statement has three row formats:
+      1. Domestic ILS:   "AMOUNT MERCHANT(reversed) DD/MM/YY"
+      2. Installment:    "TOTAL ךותמ CURRENT TOTAL_AMT ךותמ THIS_AMT MERCHANT DD/MM/YY"
+      3. Foreign:        "$ ORIG ₪ ILS_AMT MERCHANT DD/MM/YY"  (or "₪ … ₪ …")
+
+    Lines that don't match any pattern are headers/totals/junk — skipped.
+    """
+    INSTALLMENT = re.compile(
+        r'^(\d+)\s+ךותמ\s+(\d+)\s+[\d,]+\.\d{2}\s+ךותמ\s+([\d,]+\.\d{2})\s+(.+?)\s+(\d{2}/\d{2}/\d{2,4})\s*$'
+    )
+    FOREIGN = re.compile(
+        r'^[$₪]\s+[\d,]+\.\d{2}\s+₪\s+([\d,]+\.\d{2})\s+(.+?)\s+(\d{2}/\d{2}/\d{2,4})\s*$'
+    )
+    SIMPLE = re.compile(
+        r'^(-?[\d,]+\.\d{2})\s+(.+?)\s+(\d{2}/\d{2}/\d{2,4})\s*$'
+    )
+
+    transactions: list[dict] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = INSTALLMENT.match(line)
+        if m:
+            try:
+                amount = float(m.group(3).replace(",", ""))
+            except ValueError:
+                continue
+            description = _fix_rtl(m.group(4).strip().lstrip("-").strip())
+            date = _normalise_cal_date(m.group(5))
+            installment_note = f" (תשלום {m.group(2)}/{m.group(1)})"
+            transactions.append({
+                "date": date,
+                "description": description + installment_note,
+                "amount": amount,
+                "source": "כאל פועלים",
+                "type": "expense",
+            })
+            continue
+
+        m = FOREIGN.match(line)
+        if m:
+            try:
+                amount = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            if amount <= 0 or amount > 200000:
+                continue
+            description = _fix_rtl(m.group(2).strip())
+            date = _normalise_cal_date(m.group(3))
+            transactions.append({
+                "date": date,
+                "description": description,
+                "amount": amount,
+                "source": "כאל פועלים",
+                "type": "expense",
+            })
+            continue
+
+        m = SIMPLE.match(line)
+        if m:
+            try:
+                amount = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            # Skip refunds (-) for now — they'd need separate handling.
+            if amount <= 0 or amount > 200000:
+                continue
+            description = _fix_rtl(m.group(2).strip().lstrip("-").strip())
+            date = _normalise_cal_date(m.group(3))
+            transactions.append({
+                "date": date,
+                "description": description,
+                "amount": amount,
+                "source": "כאל פועלים",
+                "type": "expense",
+            })
+
+    return transactions
 
 
 def _fix_rtl(text: str) -> str:
-    """
-    pdfplumber reverses Hebrew text in two ways:
-    1. Word order is reversed
-    2. Each word's letters are reversed
-    e.g. 'יסנניפ טיא סקמ' -> 'מקס איט פיננסי'
-    Fix: reverse word order AND reverse each word's characters.
-    """
-    return " ".join(w[::-1] for w in text.split()[::-1])
+    """pdfplumber reverses Hebrew text two ways: word order and each
+    word's letters. Fix: reverse word order, then reverse the letters
+    of words that contain Hebrew. Latin words (WOLT, MBD, aliexpress)
+    stay as-is — otherwise we get "TLOW", "DBM", "sserpxeila"."""
+    def is_hebrew(w: str) -> bool:
+        return any('֐' <= c <= '׿' for c in w)
+    return " ".join(
+        (w[::-1] if is_hebrew(w) else w)
+        for w in text.split()[::-1]
+    )
 
 
 def _parse_poalim_evosh(text: str) -> list[dict]:

@@ -1,7 +1,6 @@
 import os
 import asyncio
 import tempfile
-import time
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,7 +8,7 @@ from telegram.ext import (
     filters, ContextTypes,
 )
 from file_processor import process_pdf, process_excel
-from analyzer import analyze_full, test_gemini, ocr_credit_card_images
+from analyzer import analyze_full, test_gemini
 from categories import (
     CATEGORY_RULES,
     override as override_category,
@@ -33,11 +32,14 @@ user_files = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "שלום! 👋 אני הבוט שיעזור לך לעקוב אחרי הכסף שלך.\n\n"
-        "📤 *איך להשתמש בי:*\n"
-        "1. שלח לי את קובץ ה-PDF מ*פועלים* (עו\"ש — כולל הכנסות)\n"
-        "2. שלח לי את קובץ ה-Excel מ*מקס* (פירוט חיובי אשראי)\n"
-        "3. אני אנתח הכל ואחזיר לך דוח עם הכנסות, הוצאות, תזרים נטו וטיפים 💡\n\n"
-        "אפשר לשלוח את הקבצים בכל סדר שתרצה!",
+        "📤 *שלושת הקבצים שאני צריך:*\n"
+        "1️⃣ PDF של *עו\"ש פועלים* (תנועות בחשבון)\n"
+        "2️⃣ PDF של *חיובי כרטיס כאל פועלים* (פירוט חיובים קודמים)\n"
+        "3️⃣ Excel של *מקס* (חיובי כרטיס אשראי)\n\n"
+        "ברגע ששלושתם הגיעו אני אריץ ניתוח אוטומטית — בלי כפילויות בין "
+        "סיכומי הכרטיסים שבעו\"ש לבין הפירוטים שבקבצים הנפרדים.\n\n"
+        "אפשר לשלוח את הקבצים בכל סדר. אם יש לך רק חלק מהם — שלח /analyze "
+        "כדי להריץ עם מה שיש.",
         parse_mode="Markdown"
     )
 
@@ -46,14 +48,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *פקודות זמינות*\n\n"
         "/start — הסבר התחלתי\n"
         "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
-        "/analyze — הרץ ניתוח על מה שכבר שלחת (PDF, Excel, תמונות)\n"
+        "/analyze — הרץ ניתוח על מה שכבר שלחת\n"
         "/api — בדוק שמפתח Gemini עובד\n"
         "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n"
         "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n\n"
-        "💡 *תמיכה בתמונות:* אפשר לשלוח צילומי מסך של דוח כאל פועלים. "
-        "אני אפענח אותם עם Gemini Vision ואכלול את העסקאות בדוח.\n\n"
-        "*שימוש רגיל:* שלח לי PDF של פועלים ו-Excel של מקס. אני אחזיר דוח "
-        "עם יתרה, הכנסות, הוצאות, פילוח קטגוריות, ובתי עסק מובילים.",
+        "*שימוש רגיל:* שלח לי שלושה קבצים:\n"
+        "1️⃣ PDF של עו\"ש פועלים\n"
+        "2️⃣ PDF של חיובי כרטיס פועלים (כאל)\n"
+        "3️⃣ Excel של מקס\n\n"
+        "כשכל השלושה הגיעו אני אנתח אוטומטית. הסדר לא משנה.",
         parse_mode="Markdown"
     )
 
@@ -64,91 +67,16 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ איפסתי את הנתונים שלך. תוכל לשלוח קבצים חדשים.")
 
 
-def _dedup(transactions: list[dict]) -> list[dict]:
-    """Drop transactions duplicated across multiple Cal screenshots."""
-    seen: set[tuple[str, str, float]] = set()
-    out: list[dict] = []
-    for t in transactions:
-        key = (t.get("date", ""), t.get("description", ""), float(t.get("amount", 0)))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(t)
-    return out
-
-
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Queue a credit-card screenshot. OCR happens at /analyze time —
-    all queued images are sent to Gemini in a single batched call so we
-    spend one API request regardless of how many images you uploaded."""
-    user_id = update.effective_user.id
-    if user_id not in user_files:
-        user_files[user_id] = {}
-
-    msg = update.message
-    if msg.photo:
-        tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-        mime = "image/jpeg"
-        suffix = ".jpg"
-    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-        tg_file = await context.bot.get_file(msg.document.file_id)
-        mime = msg.document.mime_type or "image/png"
-        suffix = "." + mime.split("/")[-1]
-    else:
-        return
-
-    file_path = os.path.join(TMP, f"{user_id}_cal_{tg_file.file_unique_id}{suffix}")
-    await tg_file.download_to_drive(file_path)
-    with open(file_path, "rb") as fh:
-        image_bytes = fh.read()
-
-    queue = user_files[user_id].setdefault("cal_images", [])
-    queue.append((image_bytes, mime))
-
-    await msg.reply_text(
-        f"📷 תמונה {len(queue)} בתור.\n"
-        f"שלח/י עוד תמונות, או /analyze לפענוח של כולן בקריאת API אחת."
-    )
-
-
 async def analyze_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trigger analysis explicitly. Useful when Cal images are involved
-    (we can't know how many the user will send)."""
+    """Trigger analysis explicitly with whatever files are queued."""
     user_id = update.effective_user.id
     bucket = user_files.get(user_id, {})
 
     if "poalim" not in bucket:
         await update.message.reply_text(
-            "⚠️ עדיין לא קיבלתי קובץ PDF של פועלים. שלח/י אותו לפני /analyze."
+            "⚠️ עדיין לא קיבלתי PDF של עו\"ש פועלים. שלח/י אותו לפני /analyze."
         )
         return
-
-    # OCR all queued images in a single batched Gemini call.
-    images = bucket.pop("cal_images", [])
-    if images:
-        await update.message.reply_text(
-            f"🔍 מפענח {len(images)} תמונות בקריאת API אחת... זה יקח כ-15-30 שניות."
-        )
-        try:
-            cal_rows = await ocr_credit_card_images(images)
-        except Exception as e:
-            logger.exception("Batched OCR failed")
-            await update.message.reply_text(
-                f"❌ פענוח התמונות נכשל: {type(e).__name__}: {e}\n\n"
-                f"אם זה 429 (חרגנו ממכסת ה-API) — נסה שוב מחר. אם זה 503 "
-                f"(Gemini עמוס) — נסה שוב בעוד דקה."
-            )
-            # Put the images back so the user doesn't lose them.
-            bucket["cal_images"] = images
-            return
-
-        existing = bucket.get("cal", [])
-        bucket["cal"] = _dedup(existing + cal_rows)
-        total = sum(t["amount"] for t in bucket["cal"])
-        await update.message.reply_text(
-            f"✅ פוענחו *{len(bucket['cal'])}* עסקאות כאל (סה\"כ {total:,.0f} ₪).",
-            parse_mode="Markdown",
-        )
 
     all_tx = list(bucket["poalim"]) + list(bucket.get("max", [])) + list(bucket.get("cal", []))
     await update.message.reply_text("🔍 מנתח את הנתונים...")
@@ -270,28 +198,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_files:
         user_files[user_id] = {}
 
-    # זיהוי סוג הקובץ לפי סיומת
     if file_name.endswith(".pdf"):
-        await update.message.reply_text("📥 קיבלתי את קובץ פועלים! מעבד...")
+        await update.message.reply_text("📥 קיבלתי PDF — מזהה סוג...")
         file = await context.bot.get_file(doc.file_id)
-        file_path = os.path.join(TMP, f"{user_id}_poalim.pdf")
+        file_path = os.path.join(TMP, f"{user_id}_{file.file_unique_id}.pdf")
         await file.download_to_drive(file_path)
 
-        transactions, closing_balance = process_pdf(file_path)
-        if not transactions:
-            await update.message.reply_text("⚠️ לא הצלחתי לקרוא עסקאות מה-PDF. ודא שזה קובץ פועלים תקין.")
+        transactions, closing_balance, pdf_type = process_pdf(file_path)
+        if pdf_type == "unknown" or not transactions:
+            await update.message.reply_text(
+                "⚠️ לא הצלחתי לקרוא עסקאות מה-PDF. ודא שזה PDF של עו\"ש "
+                "פועלים או של חיובי כאל פועלים."
+            )
             return
 
-        user_files[user_id]["poalim"] = transactions
-        user_files[user_id]["closing_balance"] = closing_balance
-        await update.message.reply_text(
-            f"✅ עיבדתי את קובץ פועלים — מצאתי *{len(transactions)}* עסקאות.\n\n"
-            f"עכשיו שלח לי את קובץ ה-Excel ממקס כדי שאוכל לנתח הכל יחד.",
-            parse_mode="Markdown"
-        )
+        if pdf_type == "cal":
+            user_files[user_id]["cal"] = transactions
+            total = sum(t["amount"] for t in transactions)
+            await update.message.reply_text(
+                f"✅ עיבדתי PDF של כאל פועלים — *{len(transactions)}* "
+                f"עסקאות (סה\"כ {total:,.0f} ₪).",
+                parse_mode="Markdown",
+            )
+        else:  # poalim
+            user_files[user_id]["poalim"] = transactions
+            user_files[user_id]["closing_balance"] = closing_balance
+            await update.message.reply_text(
+                f"✅ עיבדתי PDF של עו\"ש פועלים — *{len(transactions)}* תנועות.",
+                parse_mode="Markdown",
+            )
 
     elif file_name.endswith((".xlsx", ".xls")):
-        await update.message.reply_text("📥 קיבלתי את קובץ מקס! מעבד...")
+        await update.message.reply_text("📥 קיבלתי קובץ מקס! מעבד...")
         file = await context.bot.get_file(doc.file_id)
         file_path = os.path.join(TMP, f"{user_id}_max.xlsx")
         await file.download_to_drive(file_path)
@@ -303,66 +241,72 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_files[user_id]["max"] = transactions
         await update.message.reply_text(
-            f"✅ עיבדתי את קובץ מקס — מצאתי *{len(transactions)}* עסקאות.\n\n"
-            f"עכשיו שלח לי את קובץ ה-PDF מפועלים כדי שאוכל לנתח הכל יחד.",
-            parse_mode="Markdown"
+            f"✅ עיבדתי קובץ מקס — *{len(transactions)}* עסקאות.",
+            parse_mode="Markdown",
         )
 
     else:
-        await update.message.reply_text("❌ סוג קובץ לא מזוהה. שלח PDF מפועלים או Excel ממקס.")
+        await update.message.reply_text(
+            "❌ סוג קובץ לא מזוהה. שלח PDF (עו\"ש פועלים או חיובי כאל) או Excel ממקס."
+        )
         return
 
-    # Auto-analyze when both Poalim PDF and Max Excel have arrived AND no
-    # Cal images are pending (Cal images require explicit /analyze since
-    # we don't know how many the user will send).
+    # Tell the user what's still missing.
     bucket = user_files[user_id]
-    if "poalim" in bucket and "max" in bucket and "cal_images" not in bucket:
+    have = []
+    missing = []
+    for key, label in [("poalim", "PDF עו\"ש פועלים"),
+                        ("cal", "PDF כאל פועלים"),
+                        ("max", "Excel מקס")]:
+        (have if key in bucket else missing).append(label)
+    if missing:
         await update.message.reply_text(
-            "🔍 יש לי את שני הקבצים! מנתח את ההוצאות שלך עם AI... זה יקח כ-15 שניות.\n"
-            "(אם יש לך גם תמונות של כאל פועלים — שלח אותן עכשיו ואז /analyze)"
+            "📦 קיבלתי: " + ", ".join(have) + "\n"
+            "⏳ עוד חסר: " + ", ".join(missing) + "\n"
+            "אפשר גם /analyze עכשיו עם מה שיש."
         )
-        all_transactions = bucket["poalim"] + bucket["max"]
+        return
 
-        try:
-            report, uncategorized = await analyze_full(
-                all_transactions,
-                closing_balance=bucket.get("closing_balance"),
-            )
-        except Exception as e:
-            logger.exception("analyze_full raised")
-            await update.message.reply_text(
-                f"❌ שגיאה ב-analyze_full:\n{type(e).__name__}: {e}"
-            )
-            del user_files[user_id]
-            return
+    # All three files are here — auto-analyze.
+    await update.message.reply_text(
+        "🔍 יש לי את כל השלושה! מנתח... זה יקח כ-15 שניות."
+    )
+    all_transactions = bucket["poalim"] + bucket["max"] + bucket["cal"]
 
-        try:
-            await update.message.reply_text(report, parse_mode="Markdown")
-        except Exception as e:
-            # Most common cause: Markdown parsing failure on user content.
-            # Fall back to plain text so the user at least sees the data.
-            logger.exception("reply_text(Markdown) raised")
-            await update.message.reply_text(
-                f"⚠️ שלחתי את הדוח בלי Markdown ({type(e).__name__}: {e}):"
-            )
-            await update.message.reply_text(report)
-
-        if uncategorized:
-            try:
-                await _send_category_prompts(update, context, uncategorized)
-            except Exception as e:
-                logger.exception("_send_category_prompts raised")
-                await update.message.reply_text(
-                    f"⚠️ לא הצלחתי לשלוח כפתורי קטגוריות: {type(e).__name__}: {e}"
-                )
-
+    try:
+        report, uncategorized = await analyze_full(
+            all_transactions,
+            closing_balance=bucket.get("closing_balance"),
+        )
+    except Exception as e:
+        logger.exception("analyze_full raised")
+        await update.message.reply_text(
+            f"❌ שגיאה ב-analyze_full:\n{type(e).__name__}: {e}"
+        )
         del user_files[user_id]
-    elif "cal_images" in bucket:
-        # Cal flow: don't auto-analyze; user will run /analyze when ready.
+        return
+
+    try:
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        # Most common cause: Markdown parsing failure on user content.
+        # Fall back to plain text so the user at least sees the data.
+        logger.exception("reply_text(Markdown) raised")
         await update.message.reply_text(
-            f"📷 יש {len(bucket['cal_images'])} תמונות בתור. "
-            f"שלח/י /analyze כשתסיים."
+            f"⚠️ שלחתי את הדוח בלי Markdown ({type(e).__name__}: {e}):"
         )
+        await update.message.reply_text(report)
+
+    if uncategorized:
+        try:
+            await _send_category_prompts(update, context, uncategorized)
+        except Exception as e:
+            logger.exception("_send_category_prompts raised")
+            await update.message.reply_text(
+                f"⚠️ לא הצלחתי לשלוח כפתורי קטגוריות: {type(e).__name__}: {e}"
+            )
+
+    del user_files[user_id]
 
 
 def _category_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -471,8 +415,6 @@ def main():
     app.add_handler(CommandHandler("github", github_diagnose))
     app.add_handler(CommandHandler("analyze", analyze_now))
     app.add_handler(CallbackQueryHandler(category_button, pattern=r"^setcat:"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
