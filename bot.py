@@ -147,13 +147,30 @@ async def analyze_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report, uncategorized = await analyze_full(
             all_tx, closing_balance=bucket.get("closing_balance"),
         )
-        await update.message.reply_text(report, parse_mode="Markdown")
-        if uncategorized:
-            await _send_category_prompts(update, context, uncategorized)
     except Exception as e:
-        logger.error(f"analyze_now failed: {e}")
-        await update.message.reply_text(f"❌ שגיאה בניתוח: {e}")
+        logger.exception("analyze_full raised in /analyze")
+        await update.message.reply_text(
+            f"❌ שגיאה ב-analyze_full:\n{type(e).__name__}: {e}"
+        )
         return
+
+    try:
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("reply_text(Markdown) raised in /analyze")
+        await update.message.reply_text(
+            f"⚠️ שלחתי את הדוח בלי Markdown ({type(e).__name__}: {e}):"
+        )
+        await update.message.reply_text(report)
+
+    if uncategorized:
+        try:
+            await _send_category_prompts(update, context, uncategorized)
+        except Exception as e:
+            logger.exception("_send_category_prompts raised in /analyze")
+            await update.message.reply_text(
+                f"⚠️ לא הצלחתי לשלוח כפתורי קטגוריות: {type(e).__name__}: {e}"
+            )
 
     del user_files[user_id]
 
@@ -301,12 +318,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 all_transactions,
                 closing_balance=bucket.get("closing_balance"),
             )
-            await update.message.reply_text(report, parse_mode="Markdown")
-            if uncategorized:
-                await _send_category_prompts(update, context, uncategorized)
         except Exception as e:
-            logger.error(f"Error analyzing: {e}")
-            await update.message.reply_text("❌ אירעה שגיאה בניתוח. נסה שנית או פנה לתמיכה.")
+            logger.exception("analyze_full raised")
+            await update.message.reply_text(
+                f"❌ שגיאה ב-analyze_full:\n{type(e).__name__}: {e}"
+            )
+            del user_files[user_id]
+            return
+
+        try:
+            await update.message.reply_text(report, parse_mode="Markdown")
+        except Exception as e:
+            # Most common cause: Markdown parsing failure on user content.
+            # Fall back to plain text so the user at least sees the data.
+            logger.exception("reply_text(Markdown) raised")
+            await update.message.reply_text(
+                f"⚠️ שלחתי את הדוח בלי Markdown ({type(e).__name__}: {e}):"
+            )
+            await update.message.reply_text(report)
+
+        if uncategorized:
+            try:
+                await _send_category_prompts(update, context, uncategorized)
+            except Exception as e:
+                logger.exception("_send_category_prompts raised")
+                await update.message.reply_text(
+                    f"⚠️ לא הצלחתי לשלוח כפתורי קטגוריות: {type(e).__name__}: {e}"
+                )
 
         del user_files[user_id]
     elif "cal" in bucket:
