@@ -223,50 +223,88 @@ async def _get_ai_analysis(
     return cats, tips
 
 
-async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[dict]:
-    """Extract transactions from a credit-card screenshot using Gemini Vision.
+async def ocr_credit_card_images(
+    images: list[tuple[bytes, str]],
+) -> list[dict]:
+    """Extract transactions from one or more credit-card screenshots using
+    Gemini Vision. All images are sent in a single API call — so 11
+    screenshots cost 1 request instead of 11.
 
-    Returns a list of {date, description, amount, source, type} dicts ready
-    to merge with the rest of the user's transactions. The source is set
-    to "כאל פועלים" so downstream code treats them as that card's break-
-    down (which dedups the cal_summary lines in the Hapoalim PDF).
+    images: list of (image_bytes, mime_type) tuples.
 
-    Raises if GEMINI_API_KEY isn't set or the call fails.
+    Returns a list of {date, description, amount, source, type} dicts.
+    source="כאל פועלים", type="expense".
+
+    Raises if GEMINI_API_KEY isn't set or the call ultimately fails.
+    Batches automatically if the list is too large to fit in one call.
     """
     import base64
+    if not images:
+        return []
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set")
 
+    # Stay well below the typical inline-data per-request budget. 10
+    # screenshots of credit-card lists is comfortable; beyond that we
+    # split into a second call to keep the response from being truncated.
+    BATCH_SIZE = 10
+    all_transactions: list[dict] = []
+    for start in range(0, len(images), BATCH_SIZE):
+        batch = images[start:start + BATCH_SIZE]
+        rows = await _ocr_one_batch(api_key, batch)
+        all_transactions.extend(rows)
+        if start + BATCH_SIZE < len(images):
+            # Tiny pause between batches if there are more — helps the
+            # rate limiter stay happy.
+            await asyncio.sleep(5)
+
+    logger.info(f"OCR: extracted {len(all_transactions)} transactions from {len(images)} image(s)")
+    return all_transactions
+
+
+async def _ocr_one_batch(
+    api_key: str,
+    images: list[tuple[bytes, str]],
+) -> list[dict]:
+    """Send a single Gemini Vision request containing multiple images and
+    return the extracted transactions."""
+    import base64
+    n = len(images)
     prompt = (
-        "This is a screenshot from an Israeli credit-card transaction list "
-        "(likely from the Hapoalim mobile app, Cal-branded card). Each row "
-        "shows date, merchant name in Hebrew, and amount in ILS.\n\n"
-        "Extract every transaction visible. Reply with ONLY a JSON array, "
-        "no markdown, no backticks:\n"
-        '[{"date": "DD/MM/YYYY", "description": "<hebrew merchant>", "amount": 1234.56}, ...]\n\n'
-        "Rules:\n"
-        "- Use the date the user was charged (תאריך עסקה or תאריך חיוב — "
-        "whichever is shown).\n"
-        "- Use Hebrew text exactly as shown for merchant names.\n"
-        "- Amount is a positive number in ILS, even if the screen shows it "
-        "with a minus sign.\n"
-        "- For installments (תשלום X מתוך Y), use the per-installment amount, "
-        "not the total — that's what was actually charged this month.\n"
-        "- Skip headers, totals, balance lines, navigation chrome — only "
-        "transaction rows.\n"
-        "- If you can't read a field confidently, omit that transaction."
+        f"{'These are' if n > 1 else 'This is'} {n} "
+        f"screenshot{'s' if n > 1 else ''} from an Israeli credit-card "
+        f"transaction list (Hapoalim mobile app, Cal-branded card). Each "
+        f"row shows date, merchant name in Hebrew, and amount in ILS.\n\n"
+        f"Extract every transaction visible across all images. Reply with "
+        f"ONLY a JSON array, no markdown, no backticks:\n"
+        f'[{{"date": "DD/MM/YYYY", "description": "<hebrew merchant>", '
+        f'"amount": 1234.56}}, ...]\n\n'
+        f"Rules:\n"
+        f"- Date format DD/MM/YYYY. If the screen shows Hebrew month "
+        f"abbreviations (אפר' = April, מאי = May, etc.) convert to "
+        f"numeric. If year isn't visible, infer from context (current "
+        f"statement period).\n"
+        f"- Use Hebrew text exactly as shown for merchant names.\n"
+        f"- Amount is a positive number in ILS, even if shown with a "
+        f"minus sign.\n"
+        f"- For installments (תשלום X מתוך Y), use the per-installment "
+        f"amount.\n"
+        f"- Skip headers, totals, balance lines, navigation chrome.\n"
+        f"- If the same transaction appears in multiple screenshots "
+        f"(user scrolled), include it once.\n"
+        f"- If you can't read a field confidently, omit that transaction."
     )
 
-    b64 = base64.b64encode(image_bytes).decode("ascii")
+    parts: list[dict] = [{"text": prompt}]
+    for img_bytes, mime in images:
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": b64}},
-            ],
-        }],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
+        "contents": [{"parts": parts}],
+        # Higher output budget for batched calls — many transactions to emit.
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000},
     }
     model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -280,12 +318,11 @@ async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=120) as response:
             result = json.loads(response.read().decode("utf-8"))
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
-    # Retry on transient 429 (quota) / 503 (overloaded) — common when
-    # the user sends a burst of images.
+    # Retry transient 429 / 503.
     RETRYABLE = {429, 503}
     raw = None
     last_err: Exception | None = None
@@ -296,8 +333,7 @@ async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in RETRYABLE and attempt < 2:
-                # 503 usually clears in <10s; 429 needs longer.
-                await asyncio.sleep(8 if e.code == 503 else 15)
+                await asyncio.sleep(15 if e.code == 429 else 10)
             else:
                 raise
     if raw is None:
@@ -343,7 +379,6 @@ async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg
         except (ValueError, TypeError):
             continue
 
-    logger.info(f"OCR: extracted {len(transactions)} transactions from image")
     return transactions
 
 

@@ -9,7 +9,7 @@ from telegram.ext import (
     filters, ContextTypes,
 )
 from file_processor import process_pdf, process_excel
-from analyzer import analyze_full, test_gemini, ocr_credit_card_image
+from analyzer import analyze_full, test_gemini, ocr_credit_card_images
 from categories import (
     CATEGORY_RULES,
     override as override_category,
@@ -78,8 +78,9 @@ def _dedup(transactions: list[dict]) -> list[dict]:
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive a screenshot of a Cal (Hapoalim credit card) statement,
-    OCR it via Gemini Vision, and add the rows to the user's queue."""
+    """Queue a credit-card screenshot. OCR happens at /analyze time —
+    all queued images are sent to Gemini in a single batched call so we
+    spend one API request regardless of how many images you uploaded."""
     user_id = update.effective_user.id
     if user_id not in user_files:
         user_files[user_id] = {}
@@ -101,44 +102,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(file_path, "rb") as fh:
         image_bytes = fh.read()
 
-    # Tiny delay between consecutive images to avoid hammering Gemini.
-    # When the user sends a burst (7 images in ~7 sec), the API starts
-    # returning 503. Spacing them ~3s apart drops the failure rate
-    # dramatically without making interactive use feel slow.
-    last_at = context.user_data.get("last_ocr_at", 0.0)
-    gap = time.monotonic() - last_at
-    if gap < 3.0:
-        await asyncio.sleep(3.0 - gap)
-    context.user_data["last_ocr_at"] = time.monotonic()
+    queue = user_files[user_id].setdefault("cal_images", [])
+    queue.append((image_bytes, mime))
 
-    await msg.reply_text("📷 מפענח תמונה עם Gemini Vision...")
-    try:
-        rows = await ocr_credit_card_image(image_bytes, mime_type=mime)
-    except Exception as e:
-        logger.error(f"OCR failed: {e}")
-        await msg.reply_text(
-            f"❌ פענוח התמונה נכשל: {e}\n\n"
-            "אם זה שגיאת 503 (Gemini עמוס) — שלח את אותה התמונה שוב בעוד 30 שניות."
-        )
-        return
-
-    if not rows:
-        await msg.reply_text(
-            "⚠️ לא זיהיתי עסקאות בתמונה. שלח/י תמונה ברורה יותר או צילום ממסך הטלפון."
-        )
-        return
-
-    bucket = user_files[user_id].setdefault("cal", [])
-    bucket.extend(rows)
-    user_files[user_id]["cal"] = _dedup(bucket)
-
-    total = sum(t["amount"] for t in user_files[user_id]["cal"])
     await msg.reply_text(
-        f"✅ קיבלתי {len(rows)} עסקאות חדשות מהתמונה.\n"
-        f"סך הכל כרגע: *{len(user_files[user_id]['cal'])}* עסקאות כאל "
-        f"({total:,.0f} ₪).\n\n"
-        f"שלח/י עוד תמונות, או /analyze לדוח.",
-        parse_mode="Markdown",
+        f"📷 תמונה {len(queue)} בתור.\n"
+        f"שלח/י עוד תמונות, או /analyze לפענוח של כולן בקריאת API אחת."
     )
 
 
@@ -154,8 +123,35 @@ async def analyze_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # OCR all queued images in a single batched Gemini call.
+    images = bucket.pop("cal_images", [])
+    if images:
+        await update.message.reply_text(
+            f"🔍 מפענח {len(images)} תמונות בקריאת API אחת... זה יקח כ-15-30 שניות."
+        )
+        try:
+            cal_rows = await ocr_credit_card_images(images)
+        except Exception as e:
+            logger.exception("Batched OCR failed")
+            await update.message.reply_text(
+                f"❌ פענוח התמונות נכשל: {type(e).__name__}: {e}\n\n"
+                f"אם זה 429 (חרגנו ממכסת ה-API) — נסה שוב מחר. אם זה 503 "
+                f"(Gemini עמוס) — נסה שוב בעוד דקה."
+            )
+            # Put the images back so the user doesn't lose them.
+            bucket["cal_images"] = images
+            return
+
+        existing = bucket.get("cal", [])
+        bucket["cal"] = _dedup(existing + cal_rows)
+        total = sum(t["amount"] for t in bucket["cal"])
+        await update.message.reply_text(
+            f"✅ פוענחו *{len(bucket['cal'])}* עסקאות כאל (סה\"כ {total:,.0f} ₪).",
+            parse_mode="Markdown",
+        )
+
     all_tx = list(bucket["poalim"]) + list(bucket.get("max", [])) + list(bucket.get("cal", []))
-    await update.message.reply_text("🔍 מנתח...")
+    await update.message.reply_text("🔍 מנתח את הנתונים...")
 
     try:
         report, uncategorized = await analyze_full(
@@ -320,7 +316,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cal images are pending (Cal images require explicit /analyze since
     # we don't know how many the user will send).
     bucket = user_files[user_id]
-    if "poalim" in bucket and "max" in bucket and "cal" not in bucket:
+    if "poalim" in bucket and "max" in bucket and "cal_images" not in bucket:
         await update.message.reply_text(
             "🔍 יש לי את שני הקבצים! מנתח את ההוצאות שלך עם AI... זה יקח כ-15 שניות.\n"
             "(אם יש לך גם תמונות של כאל פועלים — שלח אותן עכשיו ואז /analyze)"
@@ -361,9 +357,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         del user_files[user_id]
-    elif "cal" in bucket:
+    elif "cal_images" in bucket:
         # Cal flow: don't auto-analyze; user will run /analyze when ready.
-        pass
+        await update.message.reply_text(
+            f"📷 יש {len(bucket['cal_images'])} תמונות בתור. "
+            f"שלח/י /analyze כשתסיים."
+        )
 
 
 def _category_keyboard(token: str) -> InlineKeyboardMarkup:
