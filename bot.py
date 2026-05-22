@@ -313,18 +313,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del user_files[user_id]
 
 
-def _category_keyboard(token: str) -> InlineKeyboardMarkup:
+# Telegram's callback_data limit is 64 bytes (UTF-8). After the "c:NN:"
+# prefix (max 5 bytes) we have ~59 bytes for the description. Hebrew
+# encodes as 2 bytes/char, so ~29 Hebrew chars fit.
+CB_PREFIX = "c"
+CB_MAX_DESC_BYTES = 59
+
+
+def _fits_in_callback(desc: str) -> bool:
+    return len(desc.encode("utf-8")) <= CB_MAX_DESC_BYTES
+
+
+def _category_keyboard(desc: str) -> InlineKeyboardMarkup:
     """Build an inline keyboard with one button per category.
 
-    token: a short numeric id encoded in callback_data to identify which
-    merchant the user is categorising. The full description is kept in
-    context.user_data so we don't blow the 64-byte callback_data limit.
+    The merchant description is encoded directly into each button's
+    callback_data so the button survives bot restarts (Render's free
+    tier sleeps the worker after 15 min, which used to wipe the
+    in-memory token→desc map and produce "button expired" errors).
     """
     categories = list(CATEGORY_RULES.keys())
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(categories), KEYBOARD_COLS):
         rows.append([
-            InlineKeyboardButton(cat, callback_data=f"setcat:{token}:{idx}")
+            InlineKeyboardButton(cat, callback_data=f"{CB_PREFIX}:{idx}:{desc}")
             for idx, cat in enumerate(categories[i:i + KEYBOARD_COLS], start=i)
         ])
     return InlineKeyboardMarkup(rows)
@@ -336,7 +348,6 @@ async def _send_category_prompts(
     uncategorized: list[tuple[str, float]],
 ) -> None:
     """Send one button-message per uncategorised merchant (capped)."""
-    pending = context.user_data.setdefault("pending_categories", {})
     shown = uncategorized[:MAX_BUTTON_PROMPTS]
     if len(uncategorized) > MAX_BUTTON_PROMPTS:
         await update.message.reply_text(
@@ -345,35 +356,56 @@ async def _send_category_prompts(
             f"לשאר שלח /correct."
         )
     for desc, amount in shown:
-        # Use the next available short numeric token.
-        token = str(len(pending))
-        pending[token] = desc
-        await update.message.reply_text(
-            f"🔍 *{desc}*  ({amount:,.0f} ₪)\nבחר קטגוריה:",
-            reply_markup=_category_keyboard(token),
-            parse_mode="Markdown",
-        )
+        if _fits_in_callback(desc):
+            await update.message.reply_text(
+                f"🔍 *{desc}*  ({amount:,.0f} ₪)\nבחר קטגוריה:",
+                reply_markup=_category_keyboard(desc),
+                parse_mode="Markdown",
+            )
+        else:
+            # Description too long for a 64-byte callback. Skip the button
+            # and give the user the exact /correct command to copy-paste.
+            await update.message.reply_text(
+                f"🔍 *{desc}*  ({amount:,.0f} ₪)\n"
+                f"השם ארוך מדי לכפתור — העתק את הפקודה:\n"
+                f"`/correct {desc} = <קטגוריה>`",
+                parse_mode="Markdown",
+            )
 
 
 async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback handler for the inline-keyboard taps."""
+    """Callback handler for the inline-keyboard taps.
+
+    Accepts two callback_data shapes:
+      - New "c:<cat_idx>:<desc>": description is self-contained.
+      - Old "setcat:<token>:<cat_idx>": legacy — token map is wiped on
+        restart, so we just tell the user the button is stale.
+    """
     query = update.callback_query
     await query.answer()
-    parts = (query.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "setcat":
+    data = query.data or ""
+
+    desc = None
+    cat_idx: int | None = None
+    if data.startswith(f"{CB_PREFIX}:"):
+        parts = data.split(":", 2)  # only split twice: desc may contain ":"
+        if len(parts) == 3:
+            try:
+                cat_idx = int(parts[1])
+            except ValueError:
+                return
+            desc = parts[2]
+    elif data.startswith("setcat:"):
+        # Legacy buttons from before the self-contained callback fix.
+        await query.edit_message_text(
+            "❌ הכפתור הזה ישן ולא נשמר בין הפעלות של הבוט. "
+            "שלח /analyze כדי לקבל כפתורים חדשים, "
+            "או /correct <תיאור> = <קטגוריה>"
+        )
         return
 
-    token, cat_idx_str = parts[1], parts[2]
-    try:
-        cat_idx = int(cat_idx_str)
-    except ValueError:
-        return
-
-    pending = context.user_data.get("pending_categories") or {}
-    desc = pending.get(token)
     categories = list(CATEGORY_RULES.keys())
-    if not desc or cat_idx >= len(categories):
-        await query.edit_message_text("❌ הכפתור פג תוקף. שלח /correct <תיאור> = <קטגוריה>")
+    if desc is None or cat_idx is None or cat_idx >= len(categories):
         return
 
     cat = categories[cat_idx]
@@ -392,9 +424,6 @@ async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"⚠️ *{desc}* → *{cat}* (בזיכרון; שמירה נכשלה: {err})"
     await query.edit_message_text(text, parse_mode="Markdown")
-
-    # Drop the token so it can't be reused.
-    pending.pop(token, None)
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -418,7 +447,7 @@ def main():
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(CommandHandler("github", github_diagnose))
     app.add_handler(CommandHandler("analyze", analyze_now))
-    app.add_handler(CallbackQueryHandler(category_button, pattern=r"^setcat:"))
+    app.add_handler(CallbackQueryHandler(category_button, pattern=r"^(setcat|c):"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")
