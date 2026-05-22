@@ -13,6 +13,8 @@ from categories import (
     CATEGORY_RULES,
     CUSTOM_CATEGORIES,
     create_category,
+    rename_category,
+    delete_category,
     list_all_with_contents,
     override as override_category,
     persist as persist_categories,
@@ -71,6 +73,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze — הרץ ניתוח על מה שכבר שלחת\n"
         "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n"
         "/newcategory `<שם>` — צור קטגוריה חדשה\n"
+        "/renamecategory `<שם ישן> = <שם חדש>` — שנה שם של קטגוריה שיצרת\n"
+        "/deletecategory `<שם>` — מחק קטגוריה שיצרת (המסחרים עוברים ל\"אחר\")\n"
         "/categories — הצג את כל הקטגוריות ומה מתויג בכל אחת\n"
         "/flush — סנכרן עכשיו ל-GitHub שינויים שמחכים בתור\n"
         "/api — בדוק שמפתח Gemini עובד\n"
@@ -198,6 +202,62 @@ async def new_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ נוצרה קטגוריה: *{name}*\n"
         f"_מעכשיו תופיע בכפתורים וב-/correct. סנכרון ל-GitHub כעבור "
         f"{minutes} דק' של שקט (או /flush)._",
+        parse_mode="Markdown",
+    )
+
+
+async def rename_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/renamecategory <old> = <new>"""
+    raw = (update.message.text or "").split(None, 1)
+    text = raw[1].strip() if len(raw) == 2 else ""
+    if "=" not in text:
+        await update.message.reply_text(
+            "שימוש: /renamecategory <שם ישן> = <שם חדש>\n\n"
+            "לדוגמה: `/renamecategory מילואים = שירות מילואים`",
+            parse_mode="Markdown",
+        )
+        return
+    old, _, new = text.partition("=")
+    ok, err, moved = rename_category(old.strip(), new.strip())
+    if not ok:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    await schedule_persist(
+        f"Rename category: {old.strip()} → {new.strip()} ({moved} merchants)"
+    )
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    moved_note = f" {moved} מסחרים עברו לשם החדש." if moved else ""
+    await update.message.reply_text(
+        f"✅ שינוי שם: *{old.strip()}* → *{new.strip()}*.{moved_note}\n"
+        f"_סנכרון ל-GitHub בעוד {minutes} דק' של שקט (או /flush)._",
+        parse_mode="Markdown",
+    )
+
+
+async def delete_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deletecategory <name>"""
+    raw = (update.message.text or "").split(None, 1)
+    name = raw[1].strip() if len(raw) == 2 else ""
+    if not name:
+        await update.message.reply_text(
+            "שימוש: /deletecategory <שם הקטגוריה>\n\n"
+            "מסחרים שתויגו לקטגוריה יעברו אוטומטית ל\"אחר\".",
+        )
+        return
+    ok, err, moved = delete_category(name)
+    if not ok:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    await schedule_persist(f"Delete category: {name} (moved {moved} merchants to אחר)")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    moved_note = (
+        f"{moved} מסחרים שתויגו לקטגוריה הזו עברו ל-\"אחר\"."
+        if moved else "לא היו מסחרים מתויגים אליה."
+    )
+    await update.message.reply_text(
+        f"✅ נמחקה: *{name}*.\n"
+        f"_{moved_note}_\n"
+        f"_סנכרון ל-GitHub בעוד {minutes} דק' של שקט (או /flush)._",
         parse_mode="Markdown",
     )
 
@@ -543,6 +603,8 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("correct", correct))
     app.add_handler(CommandHandler("newcategory", new_category))
+    app.add_handler(CommandHandler("renamecategory", rename_cat))
+    app.add_handler(CommandHandler("deletecategory", delete_cat))
     app.add_handler(CommandHandler("categories", list_categories))
     app.add_handler(CommandHandler("flush", flush))
     app.add_handler(CommandHandler("api", api_diagnose))

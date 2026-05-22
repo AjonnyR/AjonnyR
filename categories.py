@@ -150,6 +150,93 @@ def create_category(name: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def rename_category(old: str, new: str) -> tuple[bool, str | None, int]:
+    """Rename a USER-CREATED category. Built-in categories defined in code
+    can't be renamed at runtime — they'd come back on the next deploy.
+
+    Side effects: every merchant in LEARNED that pointed to the old name
+    is updated to the new name. Position in CATEGORY_RULES is preserved so
+    callback indices in already-sent buttons stay valid.
+
+    Returns (ok, error, num_merchants_updated)."""
+    old = old.strip()
+    new = new.strip()
+    if not old or not new:
+        return False, "שם ריק", 0
+    if old == new:
+        return False, "השם החדש זהה לישן", 0
+    if len(new) > 30:
+        return False, "השם החדש ארוך מדי (מקסימום 30 תווים)", 0
+    if new.startswith("__") or new == _CATEGORIES_KEY:
+        return False, "השם הזה שמור — בחר אחר", 0
+    if old not in CATEGORY_RULES:
+        return False, f'הקטגוריה "{old}" לא קיימת', 0
+    if old not in CUSTOM_CATEGORIES:
+        return False, (
+            f'הקטגוריה "{old}" מוגדרת בקוד ולא ניתנת לשינוי בזמן ריצה. '
+            "ערוך את categories.py ו-push."
+        ), 0
+    if new in CATEGORY_RULES:
+        return False, f'כבר קיימת קטגוריה בשם "{new}"', 0
+
+    # Preserve dict order by rebuilding — that keeps callback-data indices
+    # stable for any pending inline-button messages.
+    keywords = CATEGORY_RULES[old]
+    rebuilt: dict[str, list[str]] = {}
+    for k, v in CATEGORY_RULES.items():
+        if k == old:
+            rebuilt[new] = keywords
+        else:
+            rebuilt[k] = v
+    CATEGORY_RULES.clear()
+    CATEGORY_RULES.update(rebuilt)
+
+    CUSTOM_CATEGORIES.remove(old)
+    if new not in CUSTOM_CATEGORIES:
+        CUSTOM_CATEGORIES.append(new)
+
+    moved = 0
+    for desc, cat in list(LEARNED.items()):
+        if cat == old:
+            LEARNED[desc] = new
+            moved += 1
+    return True, None, moved
+
+
+def delete_category(name: str, move_to: str = "אחר") -> tuple[bool, str | None, int]:
+    """Delete a USER-CREATED category. Merchants previously tagged to it
+    are moved to `move_to` (default: 'אחר').
+
+    Note: deleting shifts the index of every category that follows it,
+    so callback-data on already-sent inline buttons may point to the
+    wrong category. The user can fix with /correct.
+
+    Returns (ok, error, num_merchants_moved)."""
+    name = name.strip()
+    if not name:
+        return False, "שם ריק", 0
+    if name not in CATEGORY_RULES:
+        return False, f'הקטגוריה "{name}" לא קיימת', 0
+    if name not in CUSTOM_CATEGORIES:
+        return False, (
+            f'הקטגוריה "{name}" מוגדרת בקוד ולא ניתנת למחיקה בזמן ריצה. '
+            "ערוך את categories.py ו-push."
+        ), 0
+    if move_to not in CATEGORY_RULES:
+        return False, f'קטגוריית היעד "{move_to}" לא קיימת', 0
+    if move_to == name:
+        return False, "אי אפשר להעביר את המסחרים לקטגוריה שנמחקת", 0
+
+    moved = 0
+    for desc, cat in list(LEARNED.items()):
+        if cat == name:
+            LEARNED[desc] = move_to
+            moved += 1
+    del CATEGORY_RULES[name]
+    CUSTOM_CATEGORIES.remove(name)
+    return True, None, moved
+
+
 def list_all_with_contents() -> list[tuple[str, list[str], list[str], bool]]:
     """Return [(category, static_keywords, learned_merchants, is_custom)]
     for every known category, sorted with custom categories last so they
