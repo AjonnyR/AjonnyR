@@ -1,6 +1,7 @@
 import os
 import asyncio
 import tempfile
+import time
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -100,12 +101,25 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(file_path, "rb") as fh:
         image_bytes = fh.read()
 
+    # Tiny delay between consecutive images to avoid hammering Gemini.
+    # When the user sends a burst (7 images in ~7 sec), the API starts
+    # returning 503. Spacing them ~3s apart drops the failure rate
+    # dramatically without making interactive use feel slow.
+    last_at = context.user_data.get("last_ocr_at", 0.0)
+    gap = time.monotonic() - last_at
+    if gap < 3.0:
+        await asyncio.sleep(3.0 - gap)
+    context.user_data["last_ocr_at"] = time.monotonic()
+
     await msg.reply_text("📷 מפענח תמונה עם Gemini Vision...")
     try:
         rows = await ocr_credit_card_image(image_bytes, mime_type=mime)
     except Exception as e:
         logger.error(f"OCR failed: {e}")
-        await msg.reply_text(f"❌ פענוח התמונה נכשל: {e}")
+        await msg.reply_text(
+            f"❌ פענוח התמונה נכשל: {e}\n\n"
+            "אם זה שגיאת 503 (Gemini עמוס) — שלח את אותה התמונה שוב בעוד 30 שניות."
+        )
         return
 
     if not rows:

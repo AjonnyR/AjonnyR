@@ -284,7 +284,26 @@ async def ocr_credit_card_image(image_bytes: bytes, mime_type: str = "image/jpeg
             result = json.loads(response.read().decode("utf-8"))
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
-    raw = await loop.run_in_executor(None, _call)
+    # Retry on transient 429 (quota) / 503 (overloaded) — common when
+    # the user sends a burst of images.
+    RETRYABLE = {429, 503}
+    raw = None
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            raw = await loop.run_in_executor(None, _call)
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in RETRYABLE and attempt < 2:
+                # 503 usually clears in <10s; 429 needs longer.
+                await asyncio.sleep(8 if e.code == 503 else 15)
+            else:
+                raise
+    if raw is None:
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("OCR call returned no data")
 
     clean = raw.strip()
     if clean.startswith("```"):
