@@ -14,11 +14,19 @@ from analyzer import analyze_full, test_gemini
 from categories import (
     CATEGORY_RULES,
     CUSTOM_CATEGORIES,
+    LEARNED,
+    MERCHANT_SNAPSHOT,
     create_category,
     rename_category,
     delete_category,
     list_all_with_contents,
     get_merchant_info,
+    find_matches,
+    clear_all,
+    save_month,
+    list_months,
+    clear_history,
+    normalize_description,
     override as override_category,
     persist as persist_categories,
     persistence_enabled,
@@ -74,11 +82,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — הסבר התחלתי\n"
         "/reset — נקה קבצים ששלחת ותתחיל מההתחלה\n"
         "/analyze — הרץ ניתוח על מה שכבר שלחת\n"
-        "/correct `<תיאור> = <קטגוריה>` — תקן קטגוריזציה ותשמור לעולם\n"
+        "/correct `<חלק מהשם> = <קטגוריה>` — תקן קטגוריזציה (אוטו-השלמה לפי חלק יחודי)\n"
         "/newcategory `<שם>` — צור קטגוריה חדשה\n"
         "/renamecategory `<שם ישן> = <שם חדש>` — שנה שם של קטגוריה שיצרת\n"
         "/deletecategory `<שם>` — מחק קטגוריה שיצרת (המסחרים עוברים ל\"אחר\")\n"
         "/categories — הצג את כל הקטגוריות ומה מתויג בכל אחת\n"
+        "/savemonth `[label]` — שמור את הניתוח האחרון להשוואה עתידית\n"
+        "/history — הצג חודשים שמורים\n"
+        "/clearall `כן` — נקה את כל התיוגים והקטגוריות שיצרת\n"
+        "/clearhistory `כן` — מחק את החודשים השמורים\n"
         "/flush — סנכרן עכשיו ל-GitHub שינויים שמחכים בתור\n"
         "/api — בדוק שמפתח Gemini עובד\n"
         "/github — אבחן את חיבור ה-GitHub (לשמירת קטגוריות)\n\n"
@@ -144,44 +156,113 @@ async def analyze_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User correction: /correct <description> = <category>
+    """/correct <partial> = <category>
 
-    Saves to the in-memory LEARNED dict and, if GitHub is configured,
-    commits learned.json to the repo so the correction survives restarts.
+    The <partial> doesn't have to be the exact merchant name — the bot
+    will look it up by substring in MERCHANT_SNAPSHOT ∪ LEARNED. If
+    exactly one match exists, it's applied. If multiple, the user gets
+    inline buttons to pick one or "כולם". If none, the description is
+    stored as-is (lets the user pre-tag a merchant before it appears).
     """
     raw = (update.message.text or "").split(None, 1)
     text = raw[1].strip() if len(raw) == 2 else ""
     if "=" not in text:
         cats = ", ".join(CATEGORY_RULES.keys())
         await update.message.reply_text(
-            "שימוש: /correct <תיאור> = <קטגוריה>\n\n"
-            f"קטגוריות אפשריות:\n{cats}",
+            "שימוש: /correct <חלק מהשם> = <קטגוריה>\n\n"
+            "לא צריך לכתוב את כל השם — מספיק חלק יחודי. "
+            "אם יש כמה התאמות, אבחר לך מה לתקן.\n\n"
+            f"קטגוריות: {cats}",
         )
         return
 
-    desc, _, cat = text.partition("=")
-    desc, cat = desc.strip(), cat.strip()
-    if not desc or not cat:
+    partial, _, cat = text.partition("=")
+    partial, cat = partial.strip(), cat.strip()
+    if not partial or not cat:
         await update.message.reply_text(
-            "❌ חסר תיאור או קטגוריה. שימוש: /correct <תיאור> = <קטגוריה>"
+            "❌ חסר תיאור או קטגוריה. שימוש: /correct <חלק מהשם> = <קטגוריה>"
         )
         return
-
-    if not override_category(desc, cat):
+    if cat not in CATEGORY_RULES:
         cats = ", ".join(CATEGORY_RULES.keys())
         await update.message.reply_text(
-            f"❌ הקטגוריה \"{cat}\" לא קיימת.\n\nקטגוריות אפשריות:\n{cats}"
+            f"❌ הקטגוריה \"{cat}\" לא קיימת.\n\nקטגוריות: {cats}"
         )
         return
 
-    await schedule_persist(f"User correction: {desc} → {cat}")
+    normalized = normalize_description(partial)
     minutes = PERSIST_DEBOUNCE_SECONDS // 60
-    count, total = get_merchant_info(desc)
-    qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
+
+    # Exact match (after normalisation) — apply directly.
+    if normalized in LEARNED or normalized in MERCHANT_SNAPSHOT:
+        override_category(normalized, cat)
+        await schedule_persist(f"User correction: {normalized} → {cat}")
+        count, total = get_merchant_info(normalized)
+        qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
+        await update.message.reply_text(
+            f"✅ *{normalized}*{qty} → *{cat}*\n"
+            f"_כל העסקאות בשם הזה הועברו. שמירה בעוד {minutes} דק' של שקט._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Fuzzy substring search.
+    matches = find_matches(partial)
+    if not matches:
+        # Pre-tag a name that doesn't appear in any known data yet.
+        override_category(normalized, cat)
+        await schedule_persist(f"User pre-tag: {normalized} → {cat}")
+        await update.message.reply_text(
+            f"✅ *{normalized}* → *{cat}*\n"
+            f"_לא מצאתי מסחר קיים עם השם הזה, אבל שמרתי. "
+            f"כשהמסחר יופיע בעתיד, הוא יקבל את הקטגוריה הזו._",
+            parse_mode="Markdown",
+        )
+        return
+
+    if len(matches) == 1:
+        only = matches[0]
+        override_category(only, cat)
+        await schedule_persist(f"User correction (fuzzy): {only} → {cat}")
+        count, total = get_merchant_info(only)
+        qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
+        await update.message.reply_text(
+            f"✅ *{only}*{qty} → *{cat}*\n"
+            f"_כל העסקאות בשם הזה הועברו. שמירה בעוד {minutes} דק' של שקט._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Multiple matches — present a chooser.
+    cat_idx = list(CATEGORY_RULES.keys()).index(cat)
+    # Stash the search term in callback_data so the "כולם" button can
+    # re-run find_matches without server-side state.
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for m in matches:
+        # callback_data must be ≤ 64 bytes UTF-8.
+        cb = f"fm:{cat_idx}:{m}"
+        if len(cb.encode("utf-8")) > 64:
+            # Skip — user can use a more specific partial.
+            continue
+        count, _ = get_merchant_info(m)
+        label = m[:30] + (f"  ({count})" if count else "")
+        keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+    all_cb = f"fa:{cat_idx}:{normalized}"
+    if len(all_cb.encode("utf-8")) <= 64 and len(matches) > 1:
+        keyboard.append([InlineKeyboardButton(f"⚡ כולם ({len(matches)})", callback_data=all_cb)])
+
+    if not keyboard:
+        # Names too long for callback_data. Fall back to listing.
+        lst = "\n".join(f"   • {m}" for m in matches)
+        await update.message.reply_text(
+            f"מצאתי {len(matches)} מסחרים מתאימים אבל השמות ארוכים מדי לכפתורים:\n{lst}\n\n"
+            "השתמש/י ב-/correct עם חלק יחודי יותר.",
+        )
+        return
+
     await update.message.reply_text(
-        f"✅ *{desc}*{qty} → *{cat}*\n"
-        f"_כל העסקאות בשם הזה הועברו לקטגוריה החדשה. "
-        f"שמירה ל-GitHub כעבור {minutes} דק' של שקט (או /flush)._",
+        f"🔍 מצאתי {len(matches)} מסחרים שמכילים *{partial}*.\nאיזה לתייג ל-*{cat}*?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
 
@@ -335,6 +416,101 @@ async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"/categories HTML send failed, falling back to plain: {e}")
             await update.message.reply_text(_strip_html(chunk))
+
+
+async def save_month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/savemonth [label] — snapshot the latest analysis for future comparison.
+
+    Without a label, derives "YYYY-MM" from the latest expense date in the
+    most recent /analyze. The bot auto-shows comparison vs the most recent
+    saved month in future reports."""
+    raw = (update.message.text or "").split(None, 1)
+    label = raw[1].strip() if len(raw) == 2 else None
+    ok, result = save_month(label)
+    if not ok:
+        await update.message.reply_text(f"❌ {result}")
+        return
+    await schedule_persist(f"Save month snapshot: {result}")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    await update.message.reply_text(
+        f"✅ נשמר חודש *{result}* להשוואה.\n"
+        f"_כשתעלה את החודש הבא, הדוח יציג השוואה אליו אוטומטית. "
+        f"סנכרון ל-GitHub בעוד {minutes} דק' של שקט._",
+        parse_mode="Markdown",
+    )
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/history — list saved month labels."""
+    months = list_months()
+    if not months:
+        await update.message.reply_text(
+            "אין חודשים שמורים. שלח /savemonth אחרי /analyze כדי לשמור."
+        )
+        return
+    lines = []
+    for label in months[:20]:
+        from categories import MONTHLY_HISTORY
+        snap = MONTHLY_HISTORY.get(label, {})
+        exp = snap.get("total_expense", 0)
+        inc = snap.get("total_income", 0)
+        lines.append(f"   • *{label}*: הוצאות {exp:,.0f} ₪ · הכנסות {inc:,.0f} ₪")
+    txt = "📚 *חודשים שמורים:*\n" + "\n".join(lines)
+    await update.message.reply_text(txt, parse_mode="Markdown")
+
+
+async def clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clearall [כן] — wipe LEARNED, CUSTOM_CATEGORIES, MERCHANT_SNAPSHOT.
+
+    MONTHLY_HISTORY is preserved (use /clearhistory to wipe that too).
+    Requires explicit confirmation as a second argument."""
+    raw = (update.message.text or "").split(None, 1)
+    confirm = raw[1].strip().lower() if len(raw) == 2 else ""
+    if confirm not in ("yes", "כן", "אישור"):
+        await update.message.reply_text(
+            "⚠️ פעולה זו תמחק:\n"
+            f"   • {len(LEARNED)} מסחרים מתויגים\n"
+            f"   • {len(CUSTOM_CATEGORIES)} קטגוריות שיצרת\n"
+            f"   • {len(MERCHANT_SNAPSHOT)} עסקאות בסנפשוט\n\n"
+            "_היסטוריית /savemonth נשמרת (השווה /clearhistory)._\n\n"
+            "לאישור: `/clearall כן`",
+            parse_mode="Markdown",
+        )
+        return
+    learned, custom, snap = clear_all()
+    await schedule_persist(
+        f"User /clearall: wiped {learned} merchants, {custom} categories, {snap} snapshot"
+    )
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    await update.message.reply_text(
+        f"✅ נוקה: {learned} תיוגים · {custom} קטגוריות · {snap} עסקאות בסנפשוט.\n"
+        f"_נשארו רק 3 הקטגוריות הבסיסיות + 'אחר'. "
+        f"סנכרון ל-GitHub בעוד {minutes} דק'._",
+        parse_mode="Markdown",
+    )
+
+
+async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clearhistory [כן] — wipe saved months."""
+    raw = (update.message.text or "").split(None, 1)
+    confirm = raw[1].strip().lower() if len(raw) == 2 else ""
+    n = len(list_months())
+    if n == 0:
+        await update.message.reply_text("אין היסטוריה למחוק.")
+        return
+    if confirm not in ("yes", "כן", "אישור"):
+        await update.message.reply_text(
+            f"⚠️ פעולה זו תמחק {n} חודשים שמורים. אישור: `/clearhistory כן`",
+            parse_mode="Markdown",
+        )
+        return
+    cleared = clear_history()
+    await schedule_persist(f"User /clearhistory: wiped {cleared} months")
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+    await update.message.reply_text(
+        f"✅ נמחקו {cleared} חודשים. _סנכרון בעוד {minutes} דק'._",
+        parse_mode="Markdown",
+    )
 
 
 async def flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -567,6 +743,63 @@ async def _send_category_prompts(
             )
 
 
+async def fuzzy_match_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for /correct's fuzzy-match chooser.
+
+    fm:<cat_idx>:<merchant>   — tag this specific merchant
+    fa:<cat_idx>:<partial>    — re-run find_matches and tag every result
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    action, cat_idx_str, payload = parts
+    try:
+        cat_idx = int(cat_idx_str)
+    except ValueError:
+        return
+    categories = list(CATEGORY_RULES.keys())
+    if cat_idx >= len(categories):
+        return
+    cat = categories[cat_idx]
+    minutes = PERSIST_DEBOUNCE_SECONDS // 60
+
+    if action == "fm":
+        merchant = payload
+        override_category(merchant, cat)
+        await schedule_persist(f"User correction (button): {merchant} → {cat}")
+        count, total = get_merchant_info(merchant)
+        qty = f" ({count} עסקאות, {total:,.0f} ₪)" if count > 0 else ""
+        text = (
+            f"✅ *{merchant}*{qty} → *{cat}*\n"
+            f"_כל העסקאות בשם הזה הועברו. סנכרון בעוד {minutes} דק' של שקט._"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown")
+    elif action == "fa":
+        matches = find_matches(payload)
+        if not matches:
+            await query.edit_message_text("❌ לא נמצאו התאמות (אולי נמחקו בינתיים).")
+            return
+        for m in matches:
+            override_category(m, cat)
+        await schedule_persist(
+            f"User correction (button, all): {payload} ×{len(matches)} → {cat}"
+        )
+        total_count = sum(get_merchant_info(m)[0] for m in matches)
+        total_amount = sum(get_merchant_info(m)[1] for m in matches)
+        names = "\n".join(f"   • {m}" for m in matches[:10])
+        more = f"\n   _ועוד {len(matches) - 10}..._" if len(matches) > 10 else ""
+        text = (
+            f"✅ עודכנו *{len(matches)}* מסחרים → *{cat}*"
+            f" ({total_count} עסקאות, {total_amount:,.0f} ₪):\n"
+            f"{names}{more}\n"
+            f"_סנכרון בעוד {minutes} דק' של שקט._"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown")
+
+
 async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback handler for the inline-keyboard taps.
 
@@ -642,10 +875,15 @@ def main():
     app.add_handler(CommandHandler("deletecategory", delete_cat))
     app.add_handler(CommandHandler("categories", list_categories))
     app.add_handler(CommandHandler("flush", flush))
+    app.add_handler(CommandHandler("savemonth", save_month_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("clearall", clear_all_cmd))
+    app.add_handler(CommandHandler("clearhistory", clear_history_cmd))
     app.add_handler(CommandHandler("api", api_diagnose))
     app.add_handler(CommandHandler("github", github_diagnose))
     app.add_handler(CommandHandler("analyze", analyze_now))
     app.add_handler(CallbackQueryHandler(category_button, pattern=r"^(setcat|c):"))
+    app.add_handler(CallbackQueryHandler(fuzzy_match_button, pattern=r"^f[ma]:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     webhook_url = os.environ.get("WEBHOOK_URL")

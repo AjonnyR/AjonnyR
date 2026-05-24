@@ -3,6 +3,7 @@ import openpyxl
 import re
 import logging
 from datetime import datetime, date as date_cls
+from categories import normalize_description
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def _parse_poalim_evosh(text: str) -> list[dict]:
 
         transactions.append({
             "date": date,
-            "description": description,
+            "description": normalize_description(description),
             "amount": amount,
             "source": 'פועלים עו"ש',
             "type": tx_type,
@@ -280,7 +281,7 @@ def _parse_cal_excel(wb) -> list[dict]:
 
             transactions.append({
                 "date": _format_excel_date(date_val),
-                "description": desc,
+                "description": normalize_description(desc),
                 "amount": amount,
                 "source": "כאל פועלים",
                 "type": "expense",
@@ -353,7 +354,7 @@ def _parse_max_excel(wb) -> list[dict]:
                     continue
                 transactions.append({
                     "date": date,
-                    "description": desc,
+                    "description": normalize_description(desc),
                     "amount": amount,
                     "source": "מקס",
                     "type": "expense",

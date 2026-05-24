@@ -11,6 +11,58 @@ wins. Put more specific categories above more generic ones.
 """
 
 import os
+import re
+import unicodedata
+from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Description normalisation
+# ---------------------------------------------------------------------------
+# Bank/credit exports mix Hebrew gershayim (״) with ASCII double-quote (")
+# and have inconsistent whitespace. Without normalisation, "בע״מ" and
+# "בע\"מ" produce two different entries in LEARNED, the user re-tags the
+# wrong one, and the original entry stays wrong → "duplicates" bug.
+_GERSHAYIM = "״"    # ״ (Hebrew gershayim)
+_GERESH = "׳"       # ׳ (Hebrew geresh)
+_RIGHT_SQ = "’"     # ’ (right single quotation mark)
+_LEFT_SQ = "‘"      # ‘ (left single quotation mark)
+_RIGHT_DQ = "”"     # ” (right double quotation mark)
+_LEFT_DQ = "“"      # “ (left double quotation mark)
+
+
+def normalize_description(desc: str) -> str:
+    """Canonical form for merchant descriptions so equivalent variants
+    collapse into one LEARNED / MERCHANT_SNAPSHOT key.
+
+    Handles real-world inconsistencies seen in Hapoalim / Cal / Max:
+      - Unicode NFC normalisation
+      - Hebrew gershayim ↔ ASCII double quote (בע״מ vs בע\"מ)
+      - Hebrew geresh / curly singles ↔ ASCII apostrophe
+      - Curly doubles ↔ ASCII double quote
+      - Hyphen spacing: any " -", "- ", " - " collapses to " - "; bare
+        "-" (no surrounding whitespace) is left alone so compound names
+        like "MKTPL-XYZ" stay intact
+      - Collapse runs of whitespace + trim
+      - Case-fold (Latin only — Hebrew has no case). "WOLT" and "Wolt"
+        merge into "wolt".
+    """
+    if not desc:
+        return ""
+    s = unicodedata.normalize("NFC", str(desc))
+    s = s.replace(_GERSHAYIM, '"').replace(_RIGHT_DQ, '"').replace(_LEFT_DQ, '"')
+    s = s.replace(_GERESH, "'").replace(_RIGHT_SQ, "'").replace(_LEFT_SQ, "'")
+    # Canonical hyphen spacing — only normalise when whitespace is adjacent,
+    # so "MERCHANT - X" / "MERCHANT- X" / "MERCHANT -X" all become
+    # "MERCHANT - X", but "ABC-XYZ" is left untouched.
+    s = re.sub(
+        r"\s*-\s*",
+        lambda m: " - " if " " in m.group() else "-",
+        s,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
 
 CATEGORY_RULES: dict[str, list[str]] = {
     # Three user-defined base categories. Keyword lists are intentionally
@@ -61,44 +113,76 @@ CUSTOM_CATEGORIES: list[str] = []
 # wholesale on each analyze — reflects the last upload's data.
 MERCHANT_SNAPSHOT: dict[str, dict] = {}
 
+# Per-month aggregate snapshots saved by /savemonth. Used to produce
+# month-over-month comparisons in future reports. Persists across
+# uploads — only wiped by /clearhistory (not by /clearall).
+MONTHLY_HISTORY: dict[str, dict] = {}
+
+# In-memory only: the most recent analyze's aggregates, used by
+# /savemonth to know what to save. Not persisted.
+LATEST_ANALYSIS: dict = {}
+
 # Reserved keys inside learned.json — must not collide with merchant names.
 _CATEGORIES_KEY = "__categories__"
 _SNAPSHOT_KEY = "__merchant_snapshot__"
+_HISTORY_KEY = "__monthly_history__"
 
 
 def _load_from_store() -> None:
-    """Best-effort load from GitHub on import. Failures don't crash the bot."""
+    """Best-effort load from GitHub on import. Failures don't crash the bot.
+
+    Also runs a migration: descriptions saved before description-normalisation
+    landed could have multiple equivalent keys (e.g. בע״מ vs בע\"מ). On
+    load we merge them — non-"אחר" wins over "אחר" so a real categorisation
+    overwrites the default fallback."""
     try:
         import learning_store
         loaded = learning_store.load()
         if not loaded:
             return
-        # Split: list under __categories__ = user-created category names;
-        # dict under __merchant_snapshot__ = per-merchant {count, total};
-        # string values = merchant → category mappings.
+
         custom = loaded.get(_CATEGORIES_KEY, [])
         if isinstance(custom, list):
             for name in custom:
                 if isinstance(name, str) and name and name not in CATEGORY_RULES:
                     CATEGORY_RULES[name] = []
                     CUSTOM_CATEGORIES.append(name)
+
         snapshot = loaded.get(_SNAPSHOT_KEY, {})
         if isinstance(snapshot, dict):
             for k, v in snapshot.items():
                 if not isinstance(v, dict):
                     continue
                 try:
-                    MERCHANT_SNAPSHOT[str(k)] = {
-                        "count": int(v.get("count", 0)),
-                        "total": float(v.get("total", 0.0)),
-                    }
+                    nk = normalize_description(str(k))
+                    existing = MERCHANT_SNAPSHOT.get(nk)
+                    if existing:
+                        # Two pre-normalisation variants merged: sum them.
+                        existing["count"] += int(v.get("count", 0))
+                        existing["total"] += float(v.get("total", 0.0))
+                    else:
+                        MERCHANT_SNAPSHOT[nk] = {
+                            "count": int(v.get("count", 0)),
+                            "total": float(v.get("total", 0.0)),
+                        }
                 except (TypeError, ValueError):
                     continue
+
+        history = loaded.get(_HISTORY_KEY, {})
+        if isinstance(history, dict):
+            for label, snap in history.items():
+                if isinstance(snap, dict):
+                    MONTHLY_HISTORY[str(label)] = snap
+
         for k, v in loaded.items():
-            if k in (_CATEGORIES_KEY, _SNAPSHOT_KEY):
+            if k in (_CATEGORIES_KEY, _SNAPSHOT_KEY, _HISTORY_KEY):
                 continue
             if isinstance(v, str):
-                LEARNED[str(k)] = v
+                nk = normalize_description(str(k))
+                existing = LEARNED.get(nk)
+                # Prefer any real category over "אחר" when merging duplicates.
+                if existing is None or existing == "אחר":
+                    LEARNED[nk] = v
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Couldn't load LEARNED: {e}")
@@ -109,27 +193,31 @@ _load_from_store()
 
 def _build_save_dict() -> dict:
     """Construct the dict that goes into learned.json: all learned
-    mappings PLUS the custom-categories list and the merchant-snapshot
-    under reserved keys."""
+    mappings PLUS the custom-categories list, merchant-snapshot, and
+    monthly-history under reserved keys."""
     out: dict = dict(LEARNED)
     if CUSTOM_CATEGORIES:
         out[_CATEGORIES_KEY] = sorted(set(CUSTOM_CATEGORIES))
     if MERCHANT_SNAPSHOT:
         out[_SNAPSHOT_KEY] = MERCHANT_SNAPSHOT
+    if MONTHLY_HISTORY:
+        out[_HISTORY_KEY] = MONTHLY_HISTORY
     return out
 
 
 def update_merchant_snapshot(transactions: list[dict]) -> None:
     """Recompute per-merchant {count, total} from the latest analysis.
     Replaces any previous snapshot — represents the most recent upload
-    only (matches the user's monthly review workflow)."""
+    only (matches the user's monthly review workflow). All descriptions
+    are normalised so equivalent variants merge into one entry."""
     MERCHANT_SNAPSHOT.clear()
     for t in transactions:
         desc = t.get("description")
         if not desc:
             continue
         amount = float(t.get("amount", 0.0))
-        info = MERCHANT_SNAPSHOT.setdefault(str(desc), {"count": 0, "total": 0.0})
+        key = normalize_description(str(desc))
+        info = MERCHANT_SNAPSHOT.setdefault(key, {"count": 0, "total": 0.0})
         info["count"] += 1
         info["total"] += amount
 
@@ -137,7 +225,8 @@ def update_merchant_snapshot(transactions: list[dict]) -> None:
 def get_merchant_info(desc: str) -> tuple[int, float]:
     """Return (count, total) for a description from the latest snapshot,
     or (0, 0.0) if the merchant wasn't in the most recent analysis."""
-    info = MERCHANT_SNAPSHOT.get(desc, {})
+    key = normalize_description(desc)
+    info = MERCHANT_SNAPSHOT.get(key, {})
     return int(info.get("count", 0)), float(info.get("total", 0.0))
 
 
@@ -275,6 +364,7 @@ def learn(description: str, category: str) -> bool:
     (i.e. wasn't already cached and isn't covered by a static rule)."""
     if category not in CATEGORY_RULES:
         return False
+    description = normalize_description(description)
     if LEARNED.get(description) == category:
         return False
     # Don't waste a learned slot on something the static rules already cover.
@@ -295,8 +385,93 @@ def override(description: str, category: str) -> bool:
     success, False if the category name isn't recognised."""
     if category not in CATEGORY_RULES:
         return False
-    LEARNED[description] = category
+    LEARNED[normalize_description(description)] = category
     return True
+
+
+def find_matches(partial: str, limit: int = 10) -> list[str]:
+    """Substring-search merchant descriptions in MERCHANT_SNAPSHOT ∪ LEARNED.
+    Returns up to `limit` matches, prioritised by snapshot total (biggest
+    spend first), then by name."""
+    needle = normalize_description(partial).lower()
+    if not needle:
+        return []
+    candidates = set(LEARNED.keys()) | set(MERCHANT_SNAPSHOT.keys())
+    scored: list[tuple[float, str]] = []
+    for c in candidates:
+        if needle in c.lower():
+            total = float(MERCHANT_SNAPSHOT.get(c, {}).get("total", 0.0))
+            scored.append((-total, c))
+    scored.sort()
+    return [name for _, name in scored[:limit]]
+
+
+def clear_all() -> tuple[int, int, int]:
+    """Wipe LEARNED + CUSTOM_CATEGORIES + MERCHANT_SNAPSHOT — full reset
+    of category state. MONTHLY_HISTORY is preserved (a separate command
+    handles it) because comparison baselines are precious.
+
+    Returns (n_learned, n_custom, n_snapshot) — what was cleared."""
+    n_learned = len(LEARNED)
+    n_custom = len(CUSTOM_CATEGORIES)
+    n_snapshot = len(MERCHANT_SNAPSHOT)
+    for cat in list(CUSTOM_CATEGORIES):
+        CATEGORY_RULES.pop(cat, None)
+    LEARNED.clear()
+    CUSTOM_CATEGORIES.clear()
+    MERCHANT_SNAPSHOT.clear()
+    return n_learned, n_custom, n_snapshot
+
+
+def update_latest_analysis(data: dict) -> None:
+    """Called by analyzer after each /analyze run."""
+    LATEST_ANALYSIS.clear()
+    LATEST_ANALYSIS.update(data)
+
+
+def save_month(label: str | None = None) -> tuple[bool, str]:
+    """Snapshot the latest analysis under a label so future reports can
+    compare against it. If label is None, derive it from the latest
+    expense date in LATEST_ANALYSIS (e.g. "2026-05"). Returns
+    (success, label_or_error_message)."""
+    if not LATEST_ANALYSIS:
+        return False, "אין ניתוח אחרון לשמור — הרץ /analyze קודם"
+
+    if not label:
+        latest_date = LATEST_ANALYSIS.get("latest_date")
+        if latest_date:
+            try:
+                dt = datetime.strptime(latest_date, "%d/%m/%Y")
+                label = dt.strftime("%Y-%m")
+            except (ValueError, TypeError):
+                label = datetime.now().strftime("%Y-%m")
+        else:
+            label = datetime.now().strftime("%Y-%m")
+
+    snap = dict(LATEST_ANALYSIS)
+    snap["saved_at"] = datetime.now().isoformat()
+    MONTHLY_HISTORY[label] = snap
+    return True, label
+
+
+def list_months() -> list[str]:
+    """Return saved month labels, most recent first."""
+    return sorted(MONTHLY_HISTORY.keys(), reverse=True)
+
+
+def latest_saved_month() -> tuple[str, dict] | None:
+    """Return (label, snapshot) of the most recently saved month, or None."""
+    months = list_months()
+    if not months:
+        return None
+    return months[0], MONTHLY_HISTORY[months[0]]
+
+
+def clear_history() -> int:
+    """Wipe MONTHLY_HISTORY. Returns the number of saved months cleared."""
+    n = len(MONTHLY_HISTORY)
+    MONTHLY_HISTORY.clear()
+    return n
 
 
 def persist(commit_message: str) -> tuple[bool, str | None]:

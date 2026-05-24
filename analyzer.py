@@ -9,7 +9,7 @@ from datetime import datetime
 
 from categories import (
     categorize, learn, persist, schedule_persist, get_learned,
-    update_merchant_snapshot,
+    update_merchant_snapshot, update_latest_analysis, latest_saved_month,
     CATEGORY_RULES, LEARNED,
 )
 
@@ -70,6 +70,18 @@ async def analyze_full(
     # merchant. Replaces any previous snapshot (matches the user's
     # monthly review pattern).
     update_merchant_snapshot(expenses)
+
+    # Latest-analysis aggregates for /savemonth and comparison.
+    all_dates = [t["date"] for t in transactions if t.get("date")]
+    sorted_dates = sorted(set(all_dates), key=_parse_dmy)
+    update_latest_analysis({
+        "total_expense": total_expense,
+        "total_income": total_income,
+        "net_flow": net_flow,
+        "closing_balance": closing_balance,
+        "earliest_date": sorted_dates[0] if sorted_dates else None,
+        "latest_date": sorted_dates[-1] if sorted_dates else None,
+    })
 
     poalim_count = sum(1 for t in expenses if "פועלים" in t["source"] and t["source"] != "כאל פועלים")
     max_count = sum(1 for t in expenses if t["source"] == "מקס")
@@ -157,6 +169,24 @@ async def analyze_full(
     tips = ai_tips if ai_tips else _local_tips(
         expenses, total_expense, total_income, net_flow, cat_totals
     )
+
+    # Augment LATEST_ANALYSIS with per-category breakdown — needed by
+    # /savemonth so future comparisons can show category-level deltas.
+    cats_for_history: dict[str, dict] = {}
+    for cat, total in cat_totals.items():
+        count = sum(1 for t in expenses if (
+            ai_categories.get(t["description"]) or categorize(t["description"])
+        ) == cat)
+        cats_for_history[cat] = {"total": total, "count": count}
+    update_latest_analysis({
+        "total_expense": total_expense,
+        "total_income": total_income,
+        "net_flow": net_flow,
+        "closing_balance": closing_balance,
+        "earliest_date": sorted_dates[0] if sorted_dates else None,
+        "latest_date": sorted_dates[-1] if sorted_dates else None,
+        "categories": cats_for_history,
+    })
 
     report = _format_report(
         cat_totals, top_merchants, tips, newly_learned,
@@ -459,6 +489,53 @@ def _balance_section(closing_balance: float | None) -> str:
     return f"🏦 *יתרה נוכחית בפועלים:* {closing_balance:,.2f} ₪\n\n"
 
 
+def _comparison_section(
+    cat_totals: dict[str, float], total_expense: float, total_income: float
+) -> str:
+    """If there's a saved month in history, show how the current report
+    compares to it. Built from MONTHLY_HISTORY via latest_saved_month()."""
+    pair = latest_saved_month()
+    if not pair:
+        return ""
+    label, prev = pair
+    prev_exp = float(prev.get("total_expense", 0) or 0)
+    prev_inc = float(prev.get("total_income", 0) or 0)
+    prev_cats = prev.get("categories", {}) or {}
+
+    if prev_exp <= 0:
+        return ""
+
+    def _delta(cur: float, prev: float) -> str:
+        if prev <= 0:
+            return f"חדש (+{cur:,.0f} ₪)"
+        diff = cur - prev
+        pct = diff / prev * 100
+        arrow = "↑" if diff > 0 else ("↓" if diff < 0 else "→")
+        return f"{arrow} {abs(pct):.0f}% ({diff:+,.0f} ₪)"
+
+    section = f"📊 *השוואה ל-{label}:*\n"
+    section += f"   הוצאות: {_delta(total_expense, prev_exp)}\n"
+    if prev_inc > 0:
+        section += f"   הכנסות: {_delta(total_income, prev_inc)}\n"
+
+    # Per-category deltas — only show categories that exist in both periods,
+    # sorted by absolute change.
+    cat_lines: list[tuple[float, str]] = []
+    for cat, cur_total in cat_totals.items():
+        if cur_total <= 0:
+            continue
+        prev_total = float(prev_cats.get(cat, {}).get("total", 0) or 0)
+        if prev_total == 0 and cur_total == 0:
+            continue
+        line = f"   • {cat}: {_delta(cur_total, prev_total)}"
+        cat_lines.append((abs(cur_total - prev_total), line))
+    cat_lines.sort(key=lambda x: -x[0])
+    for _, line in cat_lines[:5]:
+        section += line + "\n"
+
+    return section + "\n"
+
+
 def _local_tips(
     expenses: list[dict],
     total_expense: float,
@@ -590,6 +667,7 @@ def _format_report(
 
     report += _income_section(incomes, total_income)
     report += _net_flow_section(total_income, total_expense, net_flow)
+    report += _comparison_section(cat_totals, total_expense, total_income)
 
     if cat_totals and total_expense > 0:
         report += "📂 *פילוח הוצאות:*\n"
